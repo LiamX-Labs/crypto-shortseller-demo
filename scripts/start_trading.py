@@ -61,10 +61,15 @@ class MultiAssetTradingSystem:
             else:
                 logger.info("📱 Telegram notifications disabled")
             
-            # Set leverage for all assets
+            # Initialize instrument specifications and set leverage for all assets
             for asset in self.assets:
                 symbol = f"{asset}USDT"
                 try:
+                    # Fetch instrument specifications
+                    await self.bybit_client.get_instrument_info(symbol)
+                    logger.info(f"✅ {asset}: Instrument specifications loaded")
+                    
+                    # Set leverage
                     await self.bybit_client.set_leverage(symbol, "10", "10")
                     logger.info(f"✅ {asset}: Leverage set to 10x")
                 except Exception as e:
@@ -200,7 +205,7 @@ class MultiAssetTradingSystem:
         return ema
     
     async def execute_signal(self, signal, account_balance: float):
-        """Execute trading signal"""
+        """Execute trading signal with improved error handling and validation"""
         try:
             if signal.signal_type.value != 'ENTER_SHORT':
                 return
@@ -214,21 +219,66 @@ class MultiAssetTradingSystem:
             
             position_value = account_balance * allocation_pct
             leveraged_value = position_value * leverage
-            asset_quantity = leveraged_value / signal.price
+            raw_quantity = leveraged_value / signal.price
+            
+            logger.info(f"🔢 {asset}: Calculated raw quantity: {raw_quantity:.8f}")
+            logger.info(f"   Position value: ${position_value:.2f}, Leveraged: ${leveraged_value:.2f}")
+            
+            # Validate quantity before placing order
+            validation = self.bybit_client.validate_order_params(symbol, raw_quantity, signal.price)
+            
+            if not validation['valid']:
+                logger.error(f"❌ {asset}: Order validation failed: {'; '.join(validation['errors'])}")
+                return
+            
+            asset_quantity = validation['corrected_qty']
+            
+            if asset_quantity != raw_quantity:
+                logger.info(f"📏 {asset}: Quantity adjusted: {raw_quantity:.8f} -> {asset_quantity:.8f}")
             
             # Calculate stop loss and take profit
             stop_loss_price = signal.price * (1 + settings.risk.stop_loss_pct)  # 1.5% above entry
             take_profit_price = signal.price * (1 - settings.risk.take_profit_pct)  # 6% below entry
             
-            # Place short order
-            result = await self.bybit_client.place_order(
-                symbol=symbol,
-                side='Sell',
-                order_type='Market',
-                qty=asset_quantity,
-                stop_loss=stop_loss_price,
-                take_profit=take_profit_price
-            )
+            # Attempt to place order with retry logic
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    logger.info(f"🎯 {asset}: Placing order attempt {attempt + 1}/{max_retries}")
+                    
+                    # Place short order
+                    result = await self.bybit_client.place_order(
+                        symbol=symbol,
+                        side='Sell',
+                        order_type='Market',
+                        qty=asset_quantity,
+                        stop_loss=stop_loss_price,
+                        take_profit=take_profit_price
+                    )
+                    
+                    # If successful, break out of retry loop
+                    break
+                    
+                except Exception as order_error:
+                    logger.error(f"❌ {asset}: Order attempt {attempt + 1} failed: {order_error}")
+                    
+                    if attempt == max_retries - 1:
+                        # Final attempt failed
+                        raise order_error
+                    
+                    # Wait before retry
+                    await asyncio.sleep(1)
+                    
+                    # Re-fetch instrument specs in case they changed
+                    await self.bybit_client.get_instrument_info(symbol)
+                    
+                    # Re-validate with updated specs
+                    validation = self.bybit_client.validate_order_params(symbol, raw_quantity, signal.price)
+                    if validation['valid']:
+                        asset_quantity = validation['corrected_qty']
+                    else:
+                        logger.error(f"❌ {asset}: Validation still failed after retry: {'; '.join(validation['errors'])}")
+                        return
             
             # Update position tracking
             self.strategy_engine.update_position(

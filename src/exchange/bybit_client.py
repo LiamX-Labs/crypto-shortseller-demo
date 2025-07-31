@@ -7,6 +7,7 @@ import hashlib
 import logging
 from typing import Dict, List, Optional, Any
 from urllib.parse import urlencode
+from decimal import Decimal, ROUND_DOWN
 
 from config.settings import settings
 
@@ -22,6 +23,9 @@ class BybitClient:
         # Rate limiting
         self.last_request_time = 0
         self.request_interval = 0.1  # 100ms between requests
+        
+        # Instrument specifications cache
+        self.instrument_specs = {}
         
     def _generate_signature(self, timestamp: str, params: str) -> str:
         """Generate HMAC SHA256 signature for Bybit V5 API"""
@@ -152,17 +156,148 @@ class BybitClient:
             logger.error(f"Failed to get ticker for {symbol}: {e}")
             return {}
     
+    async def get_instrument_info(self, symbol: str) -> Dict:
+        """Get instrument specifications for symbol"""
+        try:
+            params = {
+                'category': 'linear',
+                'symbol': symbol
+            }
+            
+            result = await self._make_request('GET', '/v5/market/instruments-info', params)
+            instruments = result.get('list', [])
+            
+            if instruments:
+                instrument = instruments[0]
+                # Cache the specifications
+                self.instrument_specs[symbol] = {
+                    'symbol': symbol,
+                    'min_order_qty': float(instrument.get('lotSizeFilter', {}).get('minOrderQty', 0)),
+                    'max_order_qty': float(instrument.get('lotSizeFilter', {}).get('maxOrderQty', 0)),
+                    'qty_step': float(instrument.get('lotSizeFilter', {}).get('qtyStep', 0)),
+                    'min_notional': float(instrument.get('lotSizeFilter', {}).get('minNotionalValue', 0)),
+                    'price_tick': float(instrument.get('priceFilter', {}).get('tickSize', 0)),
+                    'status': instrument.get('status', 'Unknown')
+                }
+                logger.info(f"📋 Cached instrument specs for {symbol}:")
+                logger.info(f"   Min Qty: {self.instrument_specs[symbol]['min_order_qty']}")
+                logger.info(f"   Max Qty: {self.instrument_specs[symbol]['max_order_qty']}")
+                logger.info(f"   Qty Step: {self.instrument_specs[symbol]['qty_step']}")
+                logger.info(f"   Min Notional: {self.instrument_specs[symbol]['min_notional']}")
+                return self.instrument_specs[symbol]
+            else:
+                logger.error(f"No instrument info found for {symbol}")
+                return {}
+                
+        except Exception as e:
+            logger.error(f"Failed to get instrument info for {symbol}: {e}")
+            return {}
+    
+    def round_quantity(self, symbol: str, quantity: float) -> float:
+        """Round quantity to meet instrument specifications"""
+        if symbol not in self.instrument_specs:
+            logger.warning(f"No instrument specs cached for {symbol}, using raw quantity")
+            return quantity
+        
+        specs = self.instrument_specs[symbol]
+        qty_step = specs['qty_step']
+        min_qty = specs['min_order_qty']
+        max_qty = specs['max_order_qty']
+        
+        if qty_step <= 0:
+            logger.warning(f"Invalid qty_step for {symbol}: {qty_step}")
+            return quantity
+        
+        # Round down to nearest step
+        decimal_qty = Decimal(str(quantity))
+        decimal_step = Decimal(str(qty_step))
+        rounded_qty = float(decimal_qty // decimal_step * decimal_step)
+        
+        # Ensure minimum quantity
+        if rounded_qty < min_qty:
+            rounded_qty = min_qty
+            logger.warning(f"Quantity {quantity} below minimum {min_qty} for {symbol}, using minimum")
+        
+        # Ensure maximum quantity
+        if max_qty > 0 and rounded_qty > max_qty:
+            rounded_qty = max_qty
+            logger.warning(f"Quantity {quantity} above maximum {max_qty} for {symbol}, using maximum")
+        
+        logger.debug(f"Rounded quantity for {symbol}: {quantity} -> {rounded_qty} (step: {qty_step})")
+        return rounded_qty
+    
+    def validate_order_params(self, symbol: str, quantity: float, price: float = None) -> Dict[str, Any]:
+        """Validate order parameters against instrument specifications"""
+        validation_result = {
+            'valid': True,
+            'errors': [],
+            'warnings': [],
+            'corrected_qty': quantity,
+            'corrected_price': price
+        }
+        
+        if symbol not in self.instrument_specs:
+            validation_result['errors'].append(f"No instrument specifications for {symbol}")
+            validation_result['valid'] = False
+            return validation_result
+        
+        specs = self.instrument_specs[symbol]
+        
+        # Validate quantity
+        if quantity <= 0:
+            validation_result['errors'].append("Quantity must be positive")
+            validation_result['valid'] = False
+        
+        if quantity < specs['min_order_qty']:
+            validation_result['errors'].append(f"Quantity {quantity} below minimum {specs['min_order_qty']}")
+            validation_result['valid'] = False
+        
+        if specs['max_order_qty'] > 0 and quantity > specs['max_order_qty']:
+            validation_result['errors'].append(f"Quantity {quantity} above maximum {specs['max_order_qty']}")
+            validation_result['valid'] = False
+        
+        # Check notional value
+        if price and specs['min_notional'] > 0:
+            notional = quantity * price
+            if notional < specs['min_notional']:
+                validation_result['errors'].append(f"Notional value {notional} below minimum {specs['min_notional']}")
+                validation_result['valid'] = False
+        
+        # Round quantity to correct precision
+        validation_result['corrected_qty'] = self.round_quantity(symbol, quantity)
+        
+        return validation_result
+    
     async def place_order(self, symbol: str, side: str, order_type: str, qty: float,
                          price: float = None, stop_loss: float = None, 
                          take_profit: float = None, reduce_only: bool = False) -> Dict:
-        """Place an order on Bybit"""
+        """Place an order on Bybit with proper validation and quantity rounding"""
         try:
+            # Ensure instrument specs are available
+            if symbol not in self.instrument_specs:
+                logger.info(f"Fetching instrument specs for {symbol}")
+                await self.get_instrument_info(symbol)
+            
+            # Validate and correct order parameters
+            validation = self.validate_order_params(symbol, qty, price)
+            
+            if not validation['valid']:
+                error_msg = f"Order validation failed for {symbol}: {'; '.join(validation['errors'])}"
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+            
+            # Use corrected quantity
+            corrected_qty = validation['corrected_qty']
+            
+            if corrected_qty != qty:
+                logger.info(f"Quantity adjusted for {symbol}: {qty} -> {corrected_qty}")
+            
             params = {
                 'category': 'linear',
                 'symbol': symbol,
                 'side': side,
                 'orderType': order_type,
-                'qty': str(qty),
+                'qty': str(corrected_qty),
                 'timeInForce': 'GTC'  # Good Till Cancelled
             }
             
