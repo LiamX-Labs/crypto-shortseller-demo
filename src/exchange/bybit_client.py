@@ -208,15 +208,18 @@ class BybitClient:
             logger.warning(f"Invalid qty_step for {symbol}: {qty_step}")
             return quantity
         
-        # Round down to nearest step
+        # Use proper decimal rounding to nearest step (not floor)
         decimal_qty = Decimal(str(quantity))
         decimal_step = Decimal(str(qty_step))
-        rounded_qty = float(decimal_qty // decimal_step * decimal_step)
         
-        # Ensure minimum quantity
+        # Round to nearest step instead of rounding down
+        steps = (decimal_qty / decimal_step).quantize(Decimal('1'), rounding=ROUND_DOWN)
+        rounded_qty = float(steps * decimal_step)
+        
+        # If rounded down to 0 or below minimum, use minimum
         if rounded_qty < min_qty:
             rounded_qty = min_qty
-            logger.warning(f"Quantity {quantity} below minimum {min_qty} for {symbol}, using minimum")
+            logger.info(f"Quantity {quantity} rounded up to minimum {min_qty} for {symbol}")
         
         # Ensure maximum quantity
         if max_qty > 0 and rounded_qty > max_qty:
@@ -225,6 +228,37 @@ class BybitClient:
         
         logger.debug(f"Rounded quantity for {symbol}: {quantity} -> {rounded_qty} (step: {qty_step})")
         return rounded_qty
+    
+    def calculate_quantity_for_usdt_value(self, symbol: str, target_usdt_value: float, price: float) -> float:
+        """Calculate optimal base currency quantity for a target USDT value"""
+        if symbol not in self.instrument_specs:
+            logger.warning(f"No instrument specs cached for {symbol}, calculating basic quantity")
+            return target_usdt_value / price
+        
+        specs = self.instrument_specs[symbol]
+        min_notional = specs.get('min_notional', 5.0)
+        
+        # Ensure we meet minimum notional value
+        if target_usdt_value < min_notional:
+            logger.warning(f"Target USDT value ${target_usdt_value:.2f} below minimum notional ${min_notional:.2f}")
+            target_usdt_value = min_notional
+        
+        # Calculate raw quantity
+        raw_quantity = target_usdt_value / price
+        
+        # Round to exchange specifications
+        rounded_quantity = self.round_quantity(symbol, raw_quantity)
+        
+        # Verify the final notional value
+        final_notional = rounded_quantity * price
+        
+        if final_notional < min_notional:
+            # Increase quantity to meet minimum notional
+            required_quantity = min_notional / price
+            rounded_quantity = self.round_quantity(symbol, required_quantity)
+            logger.info(f"Adjusted quantity to meet minimum notional: {final_notional:.2f} -> {rounded_quantity * price:.2f}")
+        
+        return rounded_quantity
     
     def validate_order_params(self, symbol: str, quantity: float, price: float = None) -> Dict[str, Any]:
         """Validate order parameters against instrument specifications"""

@@ -9,6 +9,7 @@ import logging
 import signal
 import sys
 import os
+import fcntl
 from datetime import datetime, timezone
 from typing import Dict, Any
 
@@ -38,6 +39,7 @@ class MultiAssetTradingSystem:
         self.bybit_client = BybitClient()
         self.running = False
         self.assets = settings.get_asset_symbols()
+        self.lock_file = None
         
     async def initialize_system(self):
         """Initialize the trading system"""
@@ -219,22 +221,36 @@ class MultiAssetTradingSystem:
             
             position_value = account_balance * allocation_pct
             leveraged_value = position_value * leverage
+            
+            # Round leveraged value to 2 decimal places for USDT precision
+            leveraged_value = round(leveraged_value, 2)
+            
+            # Calculate quantity based on current price
             raw_quantity = leveraged_value / signal.price
             
-            logger.info(f"🔢 {asset}: Calculated raw quantity: {raw_quantity:.8f}")
+            logger.info(f"🔢 {asset}: Target USDT value: ${leveraged_value:.2f}")
             logger.info(f"   Position value: ${position_value:.2f}, Leveraged: ${leveraged_value:.2f}")
+            logger.info(f"   Price: ${signal.price:.4f}, Raw quantity: {raw_quantity:.8f}")
             
-            # Validate quantity before placing order
-            validation = self.bybit_client.validate_order_params(symbol, raw_quantity, signal.price)
+            # Get corrected quantity that meets exchange requirements
+            corrected_quantity = self.bybit_client.calculate_quantity_for_usdt_value(symbol, leveraged_value, signal.price)
+            
+            if corrected_quantity <= 0:
+                logger.error(f"❌ {asset}: Could not calculate valid quantity for ${leveraged_value:.2f} USDT")
+                return
+            
+            # Validate final quantity
+            validation = self.bybit_client.validate_order_params(symbol, corrected_quantity, signal.price)
             
             if not validation['valid']:
                 logger.error(f"❌ {asset}: Order validation failed: {'; '.join(validation['errors'])}")
                 return
             
             asset_quantity = validation['corrected_qty']
+            final_usdt_value = asset_quantity * signal.price
             
-            if asset_quantity != raw_quantity:
-                logger.info(f"📏 {asset}: Quantity adjusted: {raw_quantity:.8f} -> {asset_quantity:.8f}")
+            logger.info(f"📏 {asset}: Final quantity: {asset_quantity:.8f}")
+            logger.info(f"   Final USDT value: ${final_usdt_value:.2f}")
             
             # Calculate stop loss and take profit
             stop_loss_price = signal.price * (1 + settings.risk.stop_loss_pct)  # 1.5% above entry
@@ -474,9 +490,22 @@ class MultiAssetTradingSystem:
                 if executed_trades > 0:
                     logger.info(f"🎯 Executed {executed_trades} new trades this bar")
                 
-                # Send daily status update (every hour at minute 0)
-                current_minute = datetime.now(timezone.utc).minute
-                if current_minute == 0 and settings.telegram.enabled:
+                # Send daily status update at market open times (Tokyo: 00:00, London: 08:00, NYSE: 14:30 UTC)
+                current_time = datetime.now(timezone.utc)
+                current_hour = current_time.hour
+                current_minute = current_time.minute
+                
+                # Market open times in UTC: Tokyo 00:00, London 08:00, NYSE 14:30
+                market_open_times = [
+                    (0, 0),    # Tokyo: 00:00 UTC (09:00 JST)
+                    (8, 0),    # London: 08:00 UTC (09:00 BST/08:00 GMT)
+                    (14, 30)   # NYSE: 14:30 UTC (09:30 EST/EDT)
+                ]
+                
+                if (current_hour, current_minute) in market_open_times and settings.telegram.enabled:
+                    market_names = {(0, 0): "Tokyo", (8, 0): "London", (14, 30): "NYSE"}
+                    market_name = market_names.get((current_hour, current_minute), "Market")
+                    logger.info(f"📊 {market_name} market open - sending status update")
                     await self.send_daily_status_update(total_balance, portfolio_summary)
                 
                 # Wait for next 5-minute bar close
@@ -491,8 +520,34 @@ class MultiAssetTradingSystem:
         logger.info(f"🛑 Received signal {signum}, initiating graceful shutdown...")
         self.running = False
     
+    def acquire_lock(self):
+        """Acquire a file lock to prevent multiple instances"""
+        try:
+            self.lock_file = open('/tmp/multi_asset_trading.lock', 'w')
+            fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.lock_file.write(str(os.getpid()))
+            self.lock_file.flush()
+            return True
+        except IOError:
+            logger.error("🔒 Another instance of the trading system is already running")
+            return False
+
+    def release_lock(self):
+        """Release the file lock"""
+        if self.lock_file:
+            try:
+                fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
+                self.lock_file.close()
+                os.unlink('/tmp/multi_asset_trading.lock')
+            except:
+                pass
+
     async def run(self):
         """Run the trading system"""
+        # Acquire lock to prevent multiple instances
+        if not self.acquire_lock():
+            return
+        
         # Set up signal handlers
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
@@ -511,6 +566,7 @@ class MultiAssetTradingSystem:
         except Exception as e:
             logger.error(f"System error: {e}")
         finally:
+            self.release_lock()
             logger.info("🔴 Multi-Asset Trading System stopped")
 
 async def main():
