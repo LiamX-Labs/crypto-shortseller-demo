@@ -6,11 +6,12 @@ Automated trading system for BTC, ETH, SOL using EMA crossover signals
 
 import asyncio
 import logging
+import logging.handlers
 import signal
 import sys
 import os
 import fcntl
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any
 
 # Add project root to Python path
@@ -21,15 +22,48 @@ from src.core.strategy_engine import MultiAssetStrategyEngine, MarketData
 from src.exchange.bybit_client import BybitClient
 from src.notifications.telegram_bot import telegram_bot, notify_trade_entry, notify_trade_exit, send_daily_report, notify_market_alert
 
-# Configure logging
-logging.basicConfig(
-    level=getattr(logging, settings.log_level),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('logs/trading.log'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
+# Configure logging with daily rotation (UTC+0)
+def setup_logging():
+    """Setup logging with daily rotation using UTC+0 timezone"""
+    logger = logging.getLogger()
+    logger.setLevel(getattr(logging, settings.log_level))
+    
+    # Create logs directory if it doesn't exist
+    os.makedirs('logs', exist_ok=True)
+    
+    # Custom formatter with UTC timezone
+    class UTCFormatter(logging.Formatter):
+        def formatTime(self, record, datefmt=None):
+            dt = datetime.fromtimestamp(record.created, tz=timezone.utc)
+            if datefmt:
+                return dt.strftime(datefmt)
+            return dt.strftime('%Y-%m-%d %H:%M:%S UTC')
+    
+    formatter = UTCFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    # Daily rotating file handler (rotates at midnight UTC)
+    file_handler = logging.handlers.TimedRotatingFileHandler(
+        filename='logs/trading.log',
+        when='midnight',
+        interval=1,
+        backupCount=30,  # Keep 30 days of logs
+        utc=True  # Use UTC for rotation timing
+    )
+    file_handler.setFormatter(formatter)
+    file_handler.suffix = '%Y%m%d'  # Format: trading.log.20250805
+    
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    
+    # Add handlers
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+# Setup logging
+setup_logging()
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +74,8 @@ class MultiAssetTradingSystem:
         self.running = False
         self.assets = settings.get_asset_symbols()
         self.lock_file = None
+        self.last_daily_reset = None
+        self.account_balance = 0.0  # Cache balance from session startup
         
     async def initialize_system(self):
         """Initialize the trading system"""
@@ -49,9 +85,19 @@ class MultiAssetTradingSystem:
         logger.info(f"Assets: {', '.join(self.assets)}")
         
         try:
-            # Test exchange connection
+            # Test exchange connection and cache account balance
             balance_info = await self.bybit_client.get_account_balance()
+            if balance_info and 'list' in balance_info:
+                for account in balance_info['list']:
+                    for coin in account.get('coin', []):
+                        if coin.get('coin') == 'USDT':
+                            self.account_balance = float(coin.get('walletBalance', 0))
+                            break
+            else:
+                self.account_balance = 10000.0  # Default for testing
+            
             logger.info("✅ Exchange connection established")
+            logger.info(f"💰 Session Balance: ${self.account_balance:,.2f} USDT")
             
             # Test Telegram connection
             if settings.telegram.enabled:
@@ -206,8 +252,8 @@ class MultiAssetTradingSystem:
         
         return ema
     
-    async def execute_signal(self, signal, account_balance: float):
-        """Execute trading signal with improved error handling and validation"""
+    async def execute_signal(self, signal):
+        """Execute trading signal with real-time balance validation"""
         try:
             if signal.signal_type.value != 'ENTER_SHORT':
                 return
@@ -215,11 +261,25 @@ class MultiAssetTradingSystem:
             asset = signal.asset
             symbol = f"{asset}USDT"
             
+            # Get real-time account balance for trade validation
+            logger.info(f"🔍 {asset}: Checking account balance for trade validation")
+            balance_info = await self.bybit_client.get_account_balance()
+            current_balance = self.account_balance  # Default to cached balance
+            
+            if balance_info and 'list' in balance_info:
+                for account in balance_info['list']:
+                    for coin in account.get('coin', []):
+                        if coin.get('coin') == 'USDT':
+                            current_balance = float(coin.get('walletBalance', 0))
+                            break
+            
+            logger.info(f"💰 {asset}: Current balance for validation: ${current_balance:,.2f} USDT")
+            
             # Calculate position size (7% of balance with 10x leverage)
             allocation_pct = settings.risk.per_asset_allocation_pct
             leverage = settings.risk.leverage_per_asset
             
-            position_value = account_balance * allocation_pct
+            position_value = current_balance * allocation_pct
             leveraged_value = position_value * leverage
             
             # Round leveraged value to 2 decimal places for USDT precision
@@ -394,7 +454,7 @@ class MultiAssetTradingSystem:
         except Exception as e:
             logger.error(f"Error checking position exits: {e}")
     
-    async def send_daily_status_update(self, total_balance: float, portfolio_summary: Dict[str, Any]):
+    async def send_daily_status_update(self, portfolio_summary: Dict[str, Any]):
         """Send daily status update to Telegram"""
         if not settings.telegram.enabled:
             return
@@ -405,7 +465,7 @@ class MultiAssetTradingSystem:
             total_trades = 0  # This would need to be calculated from database
             
             status_data = {
-                'balance': total_balance,
+                'balance': self.account_balance,  # Use cached session balance
                 'active_positions': portfolio_summary['active_positions'],
                 'daily_pnl': daily_pnl,
                 'total_trades': total_trades,
@@ -417,6 +477,37 @@ class MultiAssetTradingSystem:
             
         except Exception as e:
             logger.error(f"Failed to send daily status update: {e}")
+    
+    async def check_daily_reset(self):
+        """Check if daily reset is needed at 00:01 UTC"""
+        now_utc = datetime.now(timezone.utc)
+        current_date = now_utc.date()
+        
+        # Check if we need to perform daily reset (at 00:01 UTC)
+        if (self.last_daily_reset is None or 
+            self.last_daily_reset != current_date and 
+            now_utc.hour == 0 and now_utc.minute >= 1):
+            
+            logger.info("🕐 Daily reset time reached (00:01 UTC) - Performing daily maintenance")
+            
+            # Reset daily cross counts
+            self.strategy_engine.reset_daily_cross_counts()
+            
+            # Clean up old cross events (keep last 24 hours)
+            self.strategy_engine.cleanup_old_cross_events(hours_to_keep=24)
+            
+            # Update last reset date
+            self.last_daily_reset = current_date
+            
+            # Send daily summary report
+            try:
+                portfolio_summary = self.strategy_engine.get_portfolio_summary()
+                await self.send_daily_status_update(portfolio_summary)
+                logger.info("📊 Daily summary report sent")
+            except Exception as e:
+                logger.error(f"Failed to send daily summary: {e}")
+            
+            logger.info("✅ Daily reset completed successfully")
     
     async def main_loop(self):
         """Main trading loop - processes on 5-minute bar closes"""
@@ -430,19 +521,8 @@ class MultiAssetTradingSystem:
                 current_time = datetime.now(timezone.utc).strftime('%H:%M:%S')
                 logger.info(f"🕐 {current_time} - Processing 5-minute bar close for all assets")
                 
-                # Get account balance
-                balance_info = await self.bybit_client.get_account_balance()
-                if balance_info and 'list' in balance_info:
-                    total_balance = 0
-                    for account in balance_info['list']:
-                        for coin in account.get('coin', []):
-                            if coin.get('coin') == 'USDT':
-                                total_balance = float(coin.get('walletBalance', 0))
-                                break
-                else:
-                    total_balance = 10000.0  # Default for testing
-                
-                logger.info(f"💰 Account Balance: ${total_balance:,.2f} USDT")
+                # Check for daily reset at 00:01 UTC
+                await self.check_daily_reset()
                 
                 # Process each asset on the 5-minute bar close
                 signals = {}
@@ -451,6 +531,23 @@ class MultiAssetTradingSystem:
                         market_data = await self.get_market_data(asset)
                         signal = self.strategy_engine.generate_asset_signal(market_data)
                         signals[asset] = signal
+                        
+                        # Check for market alerts
+                        alerts = self.strategy_engine.detect_market_alerts(market_data)
+                        
+                        # Send high-priority alerts to Telegram
+                        for alert in alerts:
+                            if alert.severity in ["HIGH", "MEDIUM"] and settings.telegram.enabled:
+                                try:
+                                    await notify_market_alert(
+                                        asset=alert.asset,
+                                        price=alert.price,
+                                        alert_type=alert.alert_type.value,
+                                        description=alert.description
+                                    )
+                                    logger.info(f"📱 {asset}: {alert.severity} market alert sent - {alert.alert_type.value}")
+                                except Exception as e:
+                                    logger.error(f"Failed to send market alert for {asset}: {e}")
                         
                         # Log market data analysis
                         regime = self.strategy_engine.current_regimes.get(asset, 'UNKNOWN')
@@ -469,7 +566,7 @@ class MultiAssetTradingSystem:
                 for asset, signal in signals.items():
                     if signal and signal.signal_type.value == 'ENTER_SHORT':
                         try:
-                            await self.execute_signal(signal, total_balance)
+                            await self.execute_signal(signal)
                             executed_trades += 1
                         except Exception as e:
                             logger.error(f"Failed to execute trade for {asset}: {e}")
@@ -506,7 +603,7 @@ class MultiAssetTradingSystem:
                     market_names = {(0, 0): "Tokyo", (8, 0): "London", (14, 30): "NYSE"}
                     market_name = market_names.get((current_hour, current_minute), "Market")
                     logger.info(f"📊 {market_name} market open - sending status update")
-                    await self.send_daily_status_update(total_balance, portfolio_summary)
+                    await self.send_daily_status_update(portfolio_summary)
                 
                 # Wait for next 5-minute bar close
                 await self.wait_for_next_5min_close()

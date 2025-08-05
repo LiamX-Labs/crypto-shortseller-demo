@@ -45,12 +45,13 @@ class SignalType(Enum):
 class PortfolioManager:
     def __init__(self, total_balance):
         self.total_balance = total_balance
-        self.asset_allocation = 0.07  # 7% per asset
+        self.position_size_pct = 0.21  # 21% total allocation
+        self.asset_allocation = 1.0 / 3  # Equal allocation per asset (33.33% each)
         self.leverage = 10
         self.max_assets = 3  # BTC, ETH, SOL
         
     def calculate_position_sizes(self):
-        per_asset_capital = self.total_balance * self.asset_allocation
+        per_asset_capital = self.total_balance * self.position_size_pct * self.asset_allocation
         return {
             'BTC': per_asset_capital,
             'ETH': per_asset_capital, 
@@ -58,19 +59,19 @@ class PortfolioManager:
         }
         
     def get_total_exposure(self):
-        # 7% × 3 assets × 10x leverage = 210% max exposure
-        return self.asset_allocation * self.max_assets * self.leverage
+        # 21% × 10x leverage = 210% max exposure
+        return self.position_size_pct * self.leverage
 ```
 
 ### 3. Multi-Asset Entry Logic Flow
 
-#### Step 1: Parallel EMA Cross Detection
+#### Step 1: Parallel Price-EMA Cross Detection
 ```
 FOR EACH ASSET (BTC, ETH, SOL):
-    IF EMA240 crosses below EMA600:
+    IF price crosses below EMA240 OR price crosses below EMA600:
         → Record bearish cross event for asset
         → Check asset-specific daily cross limit (max 12)
-        → Start 15-minute entry window for asset
+        → Evaluate regime conditions immediately
         → Update asset regime state
 ```
 
@@ -304,42 +305,58 @@ class MultiAssetIndicatorManager:
         self.ema_data = {asset: {'240': [], '600': []} for asset in assets}
         self.cross_events = {asset: [] for asset in assets}
     
-    def detect_asset_ema_cross(self, asset, current_ema_240, current_ema_600, 
-                              previous_ema_240, previous_ema_600):
+    def detect_asset_price_ema_cross(self, asset, current_price, previous_price,
+                                     current_ema_240, current_ema_600,
+                                     previous_ema_240, previous_ema_600):
         """
-        Independent EMA cross detection per asset
+        Independent price-EMA cross detection per asset
         """
-        # Previous state: EMA240 was above EMA600
-        was_240_above_600 = previous_ema_240 > previous_ema_600
+        cross_events = []
         
-        # Current state: EMA240 is below EMA600  
-        is_240_below_600 = current_ema_240 < current_ema_600
+        # Price vs EMA240 cross detection
+        was_price_above_240 = previous_price > previous_ema_240
+        is_price_below_240 = current_price < current_ema_240
         
-        # Bearish cross: 240 crosses below 600
-        if was_240_above_600 and is_240_below_600:
-            cross_event = {
+        if was_price_above_240 and is_price_below_240:
+            cross_events.append({
                 'asset': asset,
-                'type': 'BEARISH_CROSS',
+                'type': 'PRICE_BELOW_EMA240',
                 'timestamp': datetime.now(timezone.utc),
-                'ema_240': current_ema_240,
-                'ema_600': current_ema_600
-            }
-            
-            self.cross_events[asset].append(cross_event)
-            return cross_event
+                'price': current_price,
+                'ema': current_ema_240
+            })
         
-        return None
+        # Price vs EMA600 cross detection
+        was_price_above_600 = previous_price > previous_ema_600
+        is_price_below_600 = current_price < current_ema_600
+        
+        if was_price_above_600 and is_price_below_600:
+            cross_events.append({
+                'asset': asset,
+                'type': 'PRICE_BELOW_EMA600',
+                'timestamp': datetime.now(timezone.utc),
+                'price': current_price,
+                'ema': current_ema_600
+            })
+        
+        # Record all cross events
+        for event in cross_events:
+            self.cross_events[asset].append(event)
+        
+        return cross_events if cross_events else None
     
     def process_all_assets(self, market_data):
         """
-        Process EMA crosses for all assets simultaneously
+        Process price-EMA crosses for all assets simultaneously
         """
         cross_results = {}
         
         for asset in self.assets:
             if asset in market_data:
-                cross = self.detect_asset_ema_cross(
+                cross = self.detect_asset_price_ema_cross(
                     asset,
+                    market_data[asset]['price_current'],
+                    market_data[asset]['price_previous'],
                     market_data[asset]['ema_240_current'],
                     market_data[asset]['ema_600_current'],
                     market_data[asset]['ema_240_previous'],
@@ -416,16 +433,26 @@ class MultiAssetSignalGenerator:
     
     def generate_asset_signal(self, asset, asset_data, timestamp):
         """
-        Generate signal for individual asset
+        Generate signal for individual asset based on regime conditions
         """
-        # Check asset-specific entry conditions
-        if not self.has_recent_bearish_cross(asset, timestamp):
-            return TradingSignal(SignalType.NO_ACTION, timestamp, asset_data['price'], 
-                               f"{asset}: No recent bearish cross")
-        
+        # Check market regime for asset (primary condition)
         if self.current_regimes[asset] != MarketRegime.ACTIVE:
             return TradingSignal(SignalType.NO_ACTION, timestamp, asset_data['price'],
                                f"{asset}: Regime {self.current_regimes[asset]}")
+        
+        # Check asset-specific cross limit (secondary condition)
+        if self.daily_cross_count[asset] >= self.cross_threshold:
+            return TradingSignal(SignalType.NO_ACTION, timestamp, asset_data['price'], 
+                               f"{asset}: Daily cross limit exceeded ({self.daily_cross_count[asset]})")
+        
+        # Check if price is below both EMAs (regime validation)
+        current_price = asset_data['price']
+        ema_240 = asset_data['ema_240']
+        ema_600 = asset_data['ema_600']
+        
+        if not (current_price < ema_240 and current_price < ema_600 and ema_240 < ema_600):
+            return TradingSignal(SignalType.NO_ACTION, timestamp, asset_data['price'],
+                               f"{asset}: Price not below both EMAs")
         
         if self.asset_positions[asset]['in_position']:
             return TradingSignal(SignalType.NO_ACTION, timestamp, asset_data['price'],
@@ -915,33 +942,33 @@ def monitor_portfolio_system_health(self):
 ### 1. Multi-Asset Strategy Parameters
 ```yaml
 portfolio:
+  total_allocation_pct: 0.21  # 21% total portfolio allocation
   assets:
     - symbol: "BTC"
-      allocation_pct: 0.07
+      allocation_pct: 0.07  # 7% of balance (21% ÷ 3 assets)
       leverage: 10
       enabled: true
     - symbol: "ETH" 
-      allocation_pct: 0.07
+      allocation_pct: 0.07  # 7% of balance (21% ÷ 3 assets)
       leverage: 10
       enabled: true
     - symbol: "SOL"
-      allocation_pct: 0.07
+      allocation_pct: 0.07  # 7% of balance (21% ÷ 3 assets)
       leverage: 10
       enabled: true
   
-  max_total_exposure_pct: 2.1  # 210% maximum portfolio exposure
+  max_total_exposure_pct: 2.1  # 210% maximum portfolio exposure (21% × 10x)
   max_simultaneous_entries: 3   # Allow all assets to trade simultaneously
   correlation_limit: 0.8        # Maximum allowed asset correlation
 
 strategy:
   ema_short_period: 240         # 20 hours on 5min candles
   ema_long_period: 600          # 50 hours on 5min candles  
-  cross_threshold: 12           # Max daily crosses per asset
-  entry_window_minutes: 15      # Entry window after cross per asset
+  cross_threshold: 12           # Max daily price-EMA crosses per asset
   max_hold_hours: 24           # Maximum position hold time
 
 risk:
-  per_asset_allocation_pct: 0.07  # 7% of balance per asset
+  per_asset_allocation_pct: 0.07  # 7% of balance per asset (21% ÷ 3)
   leverage_per_asset: 10          # 10x leverage per asset
   stop_loss_pct: 0.015           # 1.5% stop loss
   take_profit_pct: 0.06          # 6% take profit  
