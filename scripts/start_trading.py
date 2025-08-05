@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.settings import settings
 from src.core.strategy_engine import MultiAssetStrategyEngine, MarketData
 from src.exchange.bybit_client import BybitClient
-from src.notifications.telegram_bot import telegram_bot, notify_trade_entry, notify_trade_exit, send_daily_report, notify_market_alert
+from src.notifications.telegram_bot import telegram_bot, notify_trade_entry, notify_trade_exit, send_daily_report, notify_regime_change
 
 # Configure logging with daily rotation (UTC+0)
 def setup_logging():
@@ -403,13 +403,14 @@ class MultiAssetTradingSystem:
                 
                 symbol = f"{asset}USDT"
                 
-                # Get current price
-                ticker = await self.bybit_client.get_ticker(symbol)
-                current_price = float(ticker.get('lastPrice', 0))
+                # Get current market data for regime information
+                market_data = await self.get_market_data(asset)
+                current_price = market_data.price
+                current_regime = self.strategy_engine.determine_market_regime(market_data)
                 
                 # Check exit conditions
-                should_exit = self.strategy_engine.should_exit_position(
-                    asset, current_price, datetime.now(timezone.utc)
+                should_exit, exit_reason = self.strategy_engine.should_exit_position(
+                    asset, current_price, datetime.now(timezone.utc), current_regime
                 )
                 
                 if should_exit:
@@ -420,13 +421,29 @@ class MultiAssetTradingSystem:
                         # Get position data for P&L calculation
                         position_data = self.strategy_engine.asset_positions[asset]
                         entry_price = position_data['entry_price']
+                        entry_time = position_data['entry_time']
                         
                         # Calculate P&L (for short: profit when price goes down)
                         pnl = (entry_price - current_price) * position_data['asset_amount']
                         pnl_pct = ((entry_price - current_price) / entry_price) * 100
                         
+                        # Calculate hold time
+                        hold_time = 'N/A'
+                        if entry_time:
+                            time_held = datetime.now(timezone.utc) - entry_time
+                            hours = int(time_held.total_seconds() // 3600)
+                            minutes = int((time_held.total_seconds() % 3600) // 60)
+                            hold_time = f"{hours}h {minutes}m"
+                        
                         # Update position tracking
                         self.strategy_engine.update_position(asset, False)
+                        
+                        # Apply quick exit cooldown if trade was closed quickly (< 60 minutes)
+                        if entry_time:
+                            trade_duration_minutes = (datetime.now(timezone.utc) - entry_time).total_seconds() / 60
+                            cooldown_applied = self.strategy_engine.apply_quick_exit_cooldown(asset, trade_duration_minutes)
+                            if cooldown_applied:
+                                logger.info(f"🕒 {asset}: Quick exit cooldown activated - {trade_duration_minutes:.1f}min trade")
                         
                         logger.info(f"🏁 {asset}: Position closed at ${current_price:.4f}")
                         logger.info(f"   P&L: ${pnl:+.2f} ({pnl_pct:+.2f}%)")
@@ -441,8 +458,8 @@ class MultiAssetTradingSystem:
                                         'entry_price': entry_price,
                                         'pnl': pnl,
                                         'pnl_pct': pnl_pct,
-                                        'exit_reason': 'Strategy Exit',
-                                        'hold_time': 'N/A'  # Could calculate actual hold time
+                                        'exit_reason': exit_reason,
+                                        'hold_time': hold_time
                                     }
                                 )
                             except Exception as e:
@@ -532,22 +549,21 @@ class MultiAssetTradingSystem:
                         signal = self.strategy_engine.generate_asset_signal(market_data)
                         signals[asset] = signal
                         
-                        # Check for market alerts
-                        alerts = self.strategy_engine.detect_market_alerts(market_data)
-                        
-                        # Send high-priority alerts to Telegram
-                        for alert in alerts:
-                            if alert.severity in ["HIGH", "MEDIUM"] and settings.telegram.enabled:
-                                try:
-                                    await notify_market_alert(
-                                        asset=alert.asset,
-                                        price=alert.price,
-                                        alert_type=alert.alert_type.value,
-                                        description=alert.description
-                                    )
-                                    logger.info(f"📱 {asset}: {alert.severity} market alert sent - {alert.alert_type.value}")
-                                except Exception as e:
-                                    logger.error(f"Failed to send market alert for {asset}: {e}")
+                        # Check for regime changes
+                        regime_change = self.strategy_engine.check_regime_change(market_data)
+                        if regime_change['changed'] and settings.telegram.enabled:
+                            try:
+                                await notify_regime_change(
+                                    asset=regime_change['asset'],
+                                    price=regime_change['price'],
+                                    previous_regime=regime_change['previous_regime'],
+                                    current_regime=regime_change['current_regime'],
+                                    ema_240=regime_change['ema_240'],
+                                    ema_600=regime_change['ema_600']
+                                )
+                                logger.info(f"📱 {asset}: Regime change notification sent - {regime_change['previous_regime']} → {regime_change['current_regime']}")
+                            except Exception as e:
+                                logger.error(f"Failed to send regime change notification for {asset}: {e}")
                         
                         # Log market data analysis
                         regime = self.strategy_engine.current_regimes.get(asset, 'UNKNOWN')

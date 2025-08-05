@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 # Add project root to Python path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.notifications.telegram_bot import telegram_bot, notify_trade_entry, notify_trade_exit, send_daily_report, notify_market_alert
+from src.notifications.telegram_bot import telegram_bot, notify_trade_entry, notify_trade_exit, send_daily_report, notify_regime_change
 
 async def test_telegram_integration():
     """Test all Telegram notification features"""
@@ -72,22 +72,50 @@ async def test_telegram_integration():
     except Exception as e:
         print(f"❌ Trade exit notification failed: {e}")
     
-    # Test 4: Market Alert
-    print("\n⚠️ Testing market alert...")
+    
+    # Test 4: Regime Change Notification
+    print("\n🔄 Testing regime change notification...")
     try:
-        await notify_market_alert(
-            asset="ETH",
-            price=2650.30,
-            alert_type="EMA Cross Approaching",
-            description="EMA240 is approaching EMA600 crossover. Price declining below both EMAs. Monitor for potential SHORT signal within next 2-3 bars."
+        await notify_regime_change(
+            asset="BTC",
+            price=45250.00,
+            previous_regime="INACTIVE",
+            current_regime="ACTIVE",
+            ema_240=45400.00,
+            ema_600=45550.00
         )
-        print("✅ Market alert sent!")
+        print("✅ Regime change notification sent!")
         await asyncio.sleep(2)
         
     except Exception as e:
-        print(f"❌ Market alert failed: {e}")
+        print(f"❌ Regime change notification failed: {e}")
     
-    # Test 5: Daily Status Report
+    # Test 5: Quick Exit Cooldown Status (Demo)
+    print("\n🕒 Testing cooldown status reporting...")
+    try:
+        # Simulate quick exit cooldown for demonstration
+        from src.core.strategy_engine import MultiAssetStrategyEngine
+        demo_engine = MultiAssetStrategyEngine()
+        demo_engine.apply_quick_exit_cooldown('BTC', 45.0)  # 45-minute trade
+        
+        portfolio_with_cooldown = demo_engine.get_portfolio_summary()
+        
+        status_data_with_cooldown = {
+            'balance': 10500.00,
+            'active_positions': 0,
+            'daily_pnl': -125.50,
+            'total_trades': 3,
+            'assets_status': portfolio_with_cooldown['assets_status']
+        }
+        
+        await send_daily_report(status_data_with_cooldown)
+        print("✅ Daily report with cooldown status sent!")
+        await asyncio.sleep(2)
+        
+    except Exception as e:
+        print(f"❌ Cooldown status test failed: {e}")
+    
+    # Test 6: Daily Status Report
     print("\n📊 Testing daily status report...")
     try:
         status_data = {

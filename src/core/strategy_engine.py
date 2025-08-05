@@ -112,6 +112,15 @@ class MultiAssetStrategyEngine:
         }
         self.alert_cooldown_minutes = 15  # Minimum time between similar alerts
         
+        # Quick exit cooldown tracking
+        self.asset_cooldowns = {
+            'BTC': None,  # Will store {'end_time': datetime, 'reason': str, 'started_at': datetime}
+            'ETH': None,
+            'SOL': None
+        }
+        self.cooldown_duration_hours = 1  # 1-hour cooldown for quick exits
+        self.quick_exit_threshold_minutes = 60  # Positions closed within 60 minutes trigger cooldown
+        
     def update_position(self, asset: str, in_position: bool, entry_price: float = 0, 
                        asset_amount: float = 0, leveraged_value: float = 0):
         """Update position tracking for an asset"""
@@ -144,6 +153,122 @@ class MultiAssetStrategyEngine:
         self.current_regimes[market_data.asset] = regime
         
         return regime
+    
+    def check_regime_change(self, market_data: MarketData) -> Dict[str, Any]:
+        """Check if there's a regime change for the asset and return details"""
+        asset = market_data.asset
+        current_regime = self.determine_market_regime(market_data)
+        previous_regime = self.previous_regimes.get(asset)
+        
+        # Update the previous regime for next check
+        self.previous_regimes[asset] = current_regime
+        
+        # Return regime change info if there was a change
+        if previous_regime is not None and previous_regime != current_regime:
+            return {
+                'changed': True,
+                'previous_regime': previous_regime.value,
+                'current_regime': current_regime.value,
+                'asset': asset,
+                'price': market_data.price,
+                'ema_240': market_data.ema_240,
+                'ema_600': market_data.ema_600
+            }
+        
+        return {'changed': False}
+    
+    def is_asset_in_cooldown(self, asset: str) -> bool:
+        """Check if asset is currently in cooldown period"""
+        cooldown = self.asset_cooldowns.get(asset)
+        if not cooldown:
+            return False
+        
+        now = datetime.now(timezone.utc)
+        return now < cooldown['end_time']
+    
+    def apply_quick_exit_cooldown(self, asset: str, trade_duration_minutes: float):
+        """Apply cooldown if trade was closed quickly (< 60 minutes)"""
+        if trade_duration_minutes < self.quick_exit_threshold_minutes:
+            now = datetime.now(timezone.utc)
+            end_time = now + timedelta(hours=self.cooldown_duration_hours)
+            
+            self.asset_cooldowns[asset] = {
+                'end_time': end_time,
+                'reason': 'Quick Exit',
+                'started_at': now,
+                'duration_hours': self.cooldown_duration_hours,
+                'trade_duration_minutes': trade_duration_minutes
+            }
+            
+            logger.info(f"🕒 {asset}: Quick exit cooldown applied - {trade_duration_minutes:.1f}min trade, "
+                       f"cooldown until {end_time.strftime('%H:%M:%S UTC')}")
+            return True
+        
+        return False
+    
+    def get_cooldown_status(self, asset: str) -> dict:
+        """Get detailed cooldown status for an asset"""
+        cooldown = self.asset_cooldowns.get(asset)
+        
+        if not cooldown:
+            return {'in_cooldown': False}
+        
+        now = datetime.now(timezone.utc)
+        
+        if now >= cooldown['end_time']:
+            # Cooldown expired, clear it
+            self.asset_cooldowns[asset] = None
+            return {'in_cooldown': False}
+        
+        # Active cooldown
+        remaining_time = cooldown['end_time'] - now
+        remaining_minutes = int(remaining_time.total_seconds() / 60)
+        
+        return {
+            'in_cooldown': True,
+            'reason': cooldown['reason'],
+            'started_at': cooldown['started_at'],
+            'end_time': cooldown['end_time'],
+            'remaining_minutes': remaining_minutes,
+            'remaining_formatted': f"{remaining_minutes // 60}h {remaining_minutes % 60}m",
+            'trade_duration_minutes': cooldown.get('trade_duration_minutes', 0)
+        }
+    
+    def get_all_cooldown_status(self) -> dict:
+        """Get cooldown status for all assets"""
+        return {
+            asset: self.get_cooldown_status(asset) 
+            for asset in ['BTC', 'ETH', 'SOL']
+        }
+    
+    def get_trade_duration(self, asset: str) -> dict:
+        """Get detailed trade duration information for an asset"""
+        if not self.asset_positions[asset]['in_position']:
+            return {'active': False, 'duration': None, 'entry_time': None}
+        
+        entry_time = self.asset_positions[asset]['entry_time']
+        if not entry_time:
+            return {'active': True, 'duration': None, 'entry_time': None}
+        
+        current_time = datetime.now(timezone.utc)
+        duration = current_time - entry_time
+        
+        # Format duration components
+        total_seconds = int(duration.total_seconds())
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+        
+        return {
+            'active': True,
+            'entry_time': entry_time,
+            'current_time': current_time,
+            'duration': duration,
+            'duration_formatted': f"{hours}h {minutes}m {seconds}s",
+            'duration_hours': duration.total_seconds() / 3600,
+            'duration_minutes': duration.total_seconds() / 60,
+            'time_remaining_24h': timedelta(hours=24) - duration if duration < timedelta(hours=24) else timedelta(0)
+        }
     
     def detect_price_ema_crosses(self, market_data: MarketData) -> list:
         """Detect price crossing below EMAs (price-EMA crosses)"""
@@ -412,6 +537,23 @@ class MultiAssetStrategyEngine:
                 }
             )
         
+        # Check asset cooldown (prevents trading during cooldown period)
+        if self.is_asset_in_cooldown(asset):
+            cooldown_status = self.get_cooldown_status(asset)
+            return TradingSignal(
+                asset=asset,
+                signal_type=SignalType.NO_ACTION,
+                price=market_data.price,
+                reason=f"Asset in cooldown - {cooldown_status['reason']} ({cooldown_status['remaining_formatted']} remaining)",
+                metadata={
+                    'ema_240': market_data.ema_240,
+                    'ema_600': market_data.ema_600,
+                    'regime': regime.value,
+                    'cross_events': cross_events,
+                    'cooldown_status': cooldown_status
+                }
+            )
+        
         # Check market regime first (primary condition)
         if regime != MarketRegime.ACTIVE:
             return TradingSignal(
@@ -472,10 +614,15 @@ class MultiAssetStrategyEngine:
             }
         )
     
-    def should_exit_position(self, asset: str, current_price: float, current_time: datetime) -> bool:
-        """Check if position should be exited based on strategy rules"""
+    def should_exit_position(self, asset: str, current_price: float, current_time: datetime, 
+                           current_regime: MarketRegime = None) -> tuple[bool, str]:
+        """Check if position should be exited based on strategy rules
+        
+        Returns:
+            tuple: (should_exit: bool, exit_reason: str)
+        """
         if not self.asset_positions[asset]['in_position']:
-            return False
+            return False, ""
         
         position = self.asset_positions[asset]
         entry_price = position['entry_price']
@@ -484,22 +631,27 @@ class MultiAssetStrategyEngine:
         # Calculate P&L percentage (for short positions: profit when price goes down)
         pnl_pct = ((entry_price - current_price) / entry_price) * 100
         
+        # Regime-based exit (highest priority - market conditions no longer favorable)
+        if current_regime and current_regime == MarketRegime.INACTIVE:
+            logger.info(f"🔴 {asset}: Regime-based exit - Market no longer favorable for shorting")
+            return True, "Regime Change (INACTIVE)"
+        
         # Time-based exit (24 hours max hold)
         if entry_time and (current_time - entry_time) > timedelta(hours=24):
             logger.info(f"🕐 {asset}: Time-based exit after 24 hours")
-            return True
+            return True, "Time Limit (24h)"
         
         # Stop loss (1.5% loss for short)
         if pnl_pct <= -1.5:
             logger.info(f"🛑 {asset}: Stop loss triggered at {pnl_pct:.2f}%")
-            return True
+            return True, "Stop Loss"
         
         # Take profit (6% profit for short)
         if pnl_pct >= 6.0:
             logger.info(f"🎯 {asset}: Take profit triggered at {pnl_pct:.2f}%")
-            return True
+            return True, "Take Profit"
         
-        return False
+        return False, ""
     
     def reset_daily_cross_counts(self):
         """Reset daily cross counts (call at start of each day)"""
@@ -539,6 +691,7 @@ class MultiAssetStrategyEngine:
         
         assets_status = {}
         for asset, position in self.asset_positions.items():
+            cooldown_status = self.get_cooldown_status(asset)
             assets_status[asset] = {
                 'in_position': position['in_position'],
                 'regime': self.current_regimes[asset].value,
@@ -546,7 +699,8 @@ class MultiAssetStrategyEngine:
                 'leveraged_value': position['leveraged_value'] if position['in_position'] else 0,
                 'daily_crosses': self.daily_cross_count[asset],
                 'recent_cross_events': len(self.recent_cross_events[asset]),
-                'recent_alerts': len(self.recent_alerts[asset])
+                'recent_alerts': len(self.recent_alerts[asset]),
+                'cooldown_status': cooldown_status
             }
         
         return {

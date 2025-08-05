@@ -238,6 +238,9 @@ benchmark_results/
 docs/build/
 docs/_build/
 
+# Documentation files
+docs/
+
 # Package manager
 poetry.lock
 Pipfile.lock

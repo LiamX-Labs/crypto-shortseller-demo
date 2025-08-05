@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TradingNotification:
-    message_type: str  # 'entry', 'exit', 'alert', 'status'
+    message_type: str  # 'entry', 'exit', 'regime_change', 'status'
     asset: str
     price: float
     signal_type: str
@@ -143,29 +143,6 @@ Keep following risk management principles!
 
         return message
     
-    def format_market_alert_message(self, notification: TradingNotification) -> str:
-        """Format market alert for community"""
-        metadata = notification.metadata or {}
-        
-        alert_type = metadata.get('alert_type', 'Market Update')
-        description = metadata.get('description', '')
-        
-        message = f"""⚠️ <b>MARKET ALERT</b> ⚠️
-
-📊 <b>{notification.asset} - {alert_type}</b>
-💰 Current Price: <b>${notification.price:,.2f}</b>
-⏰ Time: {notification.timestamp.strftime('%H:%M:%S UTC')}
-
-📝 <b>Alert Details:</b>
-{description}
-
-🔍 <b>Community Notice:</b>
-Monitor this development for potential trading opportunities
-Stay disciplined with our strategy rules
-
-#{notification.asset} #MarketAlert #Trading"""
-
-        return message
     
     def format_system_status_message(self, status_data: Dict[str, Any]) -> str:
         """Format system status update for community"""
@@ -179,10 +156,20 @@ Stay disciplined with our strategy rules
         asset_status = status_data.get('assets_status', {})
         
         regime_summary = []
+        cooldown_summary = []
+        
         for asset, data in asset_status.items():
             regime = data.get('regime', 'UNKNOWN')
             emoji = "🟢" if regime == 'ACTIVE' else "🔴"
             regime_summary.append(f"{emoji} {asset}: {regime}")
+            
+            # Check cooldown status
+            cooldown_status = data.get('cooldown_status', {})
+            if cooldown_status.get('in_cooldown', False):
+                cooldown_summary.append(
+                    f"🕒 {asset}: {cooldown_status['reason']} "
+                    f"({cooldown_status['remaining_formatted']} remaining)"
+                )
         
         message = f"""📊 <b>DAILY TRADING REPORT</b>
 
@@ -195,7 +182,10 @@ Stay disciplined with our strategy rules
 📈 <b>Market Regimes:</b>
 {chr(10).join(regime_summary)}
 
-🎯 <b>Strategy Update:</b>
+{f'''🕒 <b>Asset Cooldowns:</b>
+{chr(10).join(cooldown_summary)}
+
+''' if cooldown_summary else ''}🎯 <b>Strategy Update:</b>
 Multi-asset EMA crossover system running smoothly
 Monitoring BTC, ETH, SOL for bearish signals
 Following systematic approach with proper risk management
@@ -203,6 +193,52 @@ Following systematic approach with proper risk management
 Keep following the community for live trade updates!
 
 #DailyReport #Trading #MultiAsset #Strategy"""
+
+        return message
+    
+    def format_regime_change_message(self, notification: TradingNotification) -> str:
+        """Format regime change notification for community"""
+        metadata = notification.metadata or {}
+        
+        previous_regime = metadata.get('previous_regime', 'UNKNOWN')
+        current_regime = metadata.get('current_regime', 'UNKNOWN')
+        ema_240 = metadata.get('ema_240', 0)
+        ema_600 = metadata.get('ema_600', 0)
+        
+        # Determine emoji and message tone based on regime change
+        if current_regime == 'ACTIVE':
+            status_emoji = "🟢"
+            change_emoji = "📈"
+            status_text = "FAVORABLE FOR SHORTING"
+            description = "Market conditions now optimal for short position opportunities"
+        else:
+            status_emoji = "🔴"
+            change_emoji = "📉"
+            status_text = "UNFAVORABLE FOR SHORTING"
+            description = "Market conditions no longer optimal for shorting"
+        
+        message = f"""📊 <b>REGIME CHANGE ALERT</b> {change_emoji}
+
+{status_emoji} <b>{notification.asset} - {status_text}</b>
+💰 Current Price: <b>${notification.price:,.2f}</b>
+⏰ Time: {notification.timestamp.strftime('%H:%M:%S UTC')}
+
+🔄 <b>Regime Update:</b>
+• Previous: {previous_regime}
+• Current: <b>{current_regime}</b>
+
+📈 <b>Technical Context:</b>
+• EMA 240: ${ema_240:,.2f}
+• EMA 600: ${ema_600:,.2f}
+• Price Position: {"Below both EMAs" if current_regime == 'ACTIVE' else "Above EMAs"}
+
+📝 <b>Impact:</b>
+{description}
+
+🎯 <b>Strategy Note:</b>
+{"Monitor for potential SHORT signals" if current_regime == 'ACTIVE' else "Reduced shorting opportunities"}
+
+#{notification.asset} #RegimeChange #MarketConditions #Strategy"""
 
         return message
     
@@ -218,8 +254,8 @@ Keep following the community for live trade updates!
                 message = self.format_trade_entry_message(notification)
             elif notification.message_type == 'exit':
                 message = self.format_trade_exit_message(notification)
-            elif notification.message_type == 'alert':
-                message = self.format_market_alert_message(notification)
+            elif notification.message_type == 'regime_change':
+                message = self.format_regime_change_message(notification)
             else:
                 logger.warning(f"Unknown notification type: {notification.message_type}")
                 return
@@ -324,17 +360,21 @@ async def notify_trade_exit(asset: str, price: float, metadata: Dict[str, Any] =
     )
     await telegram_bot.send_trade_notification(notification)
 
-async def notify_market_alert(asset: str, price: float, alert_type: str, description: str):
-    """Helper function to send market alert"""
+
+async def notify_regime_change(asset: str, price: float, previous_regime: str, current_regime: str, 
+                              ema_240: float, ema_600: float):
+    """Helper function to notify regime change"""
     notification = TradingNotification(
-        message_type='alert',
+        message_type='regime_change',
         asset=asset,
         price=price,
-        signal_type='ALERT',
+        signal_type='REGIME_CHANGE',
         timestamp=datetime.now(timezone.utc),
         metadata={
-            'alert_type': alert_type,
-            'description': description
+            'previous_regime': previous_regime,
+            'current_regime': current_regime,
+            'ema_240': ema_240,
+            'ema_600': ema_600
         }
     )
     await telegram_bot.send_trade_notification(notification)
