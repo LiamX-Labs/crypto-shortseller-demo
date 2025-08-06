@@ -477,12 +477,35 @@ class MultiAssetTradingSystem:
             return
         
         try:
-            # Calculate daily P&L (simplified - would need historical data for accuracy)
-            daily_pnl = 0  # This would need to be calculated from database
-            total_trades = 0  # This would need to be calculated from database
+            # Get fresh account balance from Bybit
+            try:
+                balance_info = await self.bybit_client.get_account_balance()
+                current_balance = 0.0
+                if balance_info and 'list' in balance_info:
+                    for account in balance_info['list']:
+                        if account.get('accountType') == 'UNIFIED':
+                            coins = account.get('coin', [])
+                            for coin in coins:
+                                if coin.get('coin') == 'USDT':
+                                    current_balance = float(coin.get('walletBalance', 0))
+                                    break
+                            break
+                logger.info(f"💰 Fresh account balance retrieved: ${current_balance:,.2f} USDT")
+            except Exception as e:
+                logger.error(f"Failed to get fresh account balance: {e}")
+                current_balance = self.account_balance  # Fall back to cached balance
+            
+            # Get daily P&L and trade count from Bybit V5 API
+            try:
+                daily_pnl = await self.bybit_client.get_daily_pnl()
+                total_trades = await self.bybit_client.get_trade_count_today()
+            except Exception as e:
+                logger.error(f"Failed to get daily P&L or trade count: {e}")
+                daily_pnl = 0.0
+                total_trades = 0
             
             status_data = {
-                'balance': self.account_balance,  # Use cached session balance
+                'balance': current_balance,  # Use fresh balance from Bybit
                 'active_positions': portfolio_summary['active_positions'],
                 'daily_pnl': daily_pnl,
                 'total_trades': total_trades,
@@ -516,14 +539,6 @@ class MultiAssetTradingSystem:
             # Update last reset date
             self.last_daily_reset = current_date
             
-            # Send daily summary report
-            try:
-                portfolio_summary = self.strategy_engine.get_portfolio_summary()
-                await self.send_daily_status_update(portfolio_summary)
-                logger.info("📊 Daily summary report sent")
-            except Exception as e:
-                logger.error(f"Failed to send daily summary: {e}")
-            
             logger.info("✅ Daily reset completed successfully")
     
     async def main_loop(self):
@@ -543,27 +558,19 @@ class MultiAssetTradingSystem:
                 
                 # Process each asset on the 5-minute bar close
                 signals = {}
+                regime_changes = {}  # Track regime changes for later notification
+                
                 for asset in self.assets:
                     try:
                         market_data = await self.get_market_data(asset)
                         signal = self.strategy_engine.generate_asset_signal(market_data)
                         signals[asset] = signal
                         
-                        # Check for regime changes
+                        # Check for regime changes (but don't notify yet)
                         regime_change = self.strategy_engine.check_regime_change(market_data)
-                        if regime_change['changed'] and settings.telegram.enabled:
-                            try:
-                                await notify_regime_change(
-                                    asset=regime_change['asset'],
-                                    price=regime_change['price'],
-                                    previous_regime=regime_change['previous_regime'],
-                                    current_regime=regime_change['current_regime'],
-                                    ema_240=regime_change['ema_240'],
-                                    ema_600=regime_change['ema_600']
-                                )
-                                logger.info(f"📱 {asset}: Regime change notification sent - {regime_change['previous_regime']} → {regime_change['current_regime']}")
-                            except Exception as e:
-                                logger.error(f"Failed to send regime change notification for {asset}: {e}")
+                        if regime_change['changed']:
+                            regime_changes[asset] = regime_change
+                            logger.info(f"📊 {asset}: Regime changed from {regime_change['previous_regime']} → {regime_change['current_regime']} (notification will be sent only if trade is executed)")
                         
                         # Log market data analysis
                         regime = self.strategy_engine.current_regimes.get(asset, 'UNKNOWN')
@@ -584,6 +591,22 @@ class MultiAssetTradingSystem:
                         try:
                             await self.execute_signal(signal)
                             executed_trades += 1
+                            
+                            # Send regime change notification only when a trade is executed
+                            if asset in regime_changes and settings.telegram.enabled:
+                                try:
+                                    regime_change = regime_changes[asset]
+                                    await notify_regime_change(
+                                        asset=regime_change['asset'],
+                                        price=regime_change['price'],
+                                        previous_regime=regime_change['previous_regime'],
+                                        current_regime=regime_change['current_regime'],
+                                        ema_240=regime_change['ema_240'],
+                                        ema_600=regime_change['ema_600']
+                                    )
+                                    logger.info(f"📱 {asset}: Regime change notification sent with trade execution - {regime_change['previous_regime']} → {regime_change['current_regime']}")
+                                except Exception as e:
+                                    logger.error(f"Failed to send regime change notification for {asset}: {e}")
                         except Exception as e:
                             logger.error(f"Failed to execute trade for {asset}: {e}")
                 

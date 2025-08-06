@@ -495,3 +495,75 @@ class BybitClient:
         except Exception as e:
             logger.error(f"Failed to close position for {symbol}: {e}")
             raise
+    
+    async def get_pnl_history(self, start_time: int = None, end_time: int = None, limit: int = 200) -> List[Dict]:
+        """Get P&L history from Bybit V5 API"""
+        try:
+            params = {
+                'category': 'linear',
+                'limit': limit
+            }
+            
+            if start_time:
+                params['startTime'] = start_time
+            if end_time:
+                params['endTime'] = end_time
+            
+            result = await self._make_request('GET', '/v5/position/closed-pnl', params)
+            return result.get('list', [])
+            
+        except Exception as e:
+            logger.error(f"Failed to get P&L history: {e}")
+            return []
+    
+    async def get_daily_pnl(self) -> float:
+        """Get today's P&L from Bybit V5 API"""
+        try:
+            # Calculate today's start and end timestamps in milliseconds
+            from datetime import datetime, timezone, timedelta
+            
+            now_utc = datetime.now(timezone.utc)
+            today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+            today_end = today_start + timedelta(days=1)
+            
+            start_timestamp = int(today_start.timestamp() * 1000)
+            end_timestamp = int(today_end.timestamp() * 1000)
+            
+            # Get P&L history for today
+            pnl_records = await self.get_pnl_history(start_timestamp, end_timestamp, limit=200)
+            
+            total_pnl = 0.0
+            for record in pnl_records:
+                # closedPnl includes fees and is the net P&L
+                pnl = float(record.get('closedPnl', 0))
+                total_pnl += pnl
+            
+            logger.info(f"💰 Daily P&L calculated: ${total_pnl:+.2f} USDT (from {len(pnl_records)} closed positions)")
+            return total_pnl
+            
+        except Exception as e:
+            logger.error(f"Failed to get daily P&L: {e}")
+            return 0.0
+    
+    async def get_trade_count_today(self) -> int:
+        """Get count of trades executed today"""
+        try:
+            from datetime import datetime, timezone, timedelta
+            
+            now_utc = datetime.now(timezone.utc)
+            today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+            today_end = today_start + timedelta(days=1)
+            
+            start_timestamp = int(today_start.timestamp() * 1000)
+            end_timestamp = int(today_end.timestamp() * 1000)
+            
+            # Get P&L history for today (each record represents a closed trade)
+            pnl_records = await self.get_pnl_history(start_timestamp, end_timestamp, limit=200)
+            
+            trade_count = len(pnl_records)
+            logger.info(f"📊 Today's trade count: {trade_count}")
+            return trade_count
+            
+        except Exception as e:
+            logger.error(f"Failed to get trade count: {e}")
+            return 0
