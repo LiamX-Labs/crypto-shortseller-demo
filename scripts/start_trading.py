@@ -74,7 +74,7 @@ class MultiAssetTradingSystem:
         self.running = False
         self.assets = settings.get_asset_symbols()
         self.lock_file = None
-        self.last_daily_reset = None
+        self.last_daily_reset = datetime.now(timezone.utc).date()
         self.account_balance = 0.0  # Cache balance from session startup
         
     async def initialize_system(self):
