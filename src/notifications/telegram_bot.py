@@ -76,6 +76,8 @@ class TelegramCommunityBot:
         # Calculate risk levels
         stop_loss_pct = metadata.get('stop_loss_pct', 1.5)
         take_profit_pct = metadata.get('take_profit_pct', 6.0)
+        trailing_stop_pct = metadata.get('trailing_stop_pct', 2.0)
+        trailing_activation_pct = metadata.get('trailing_activation_pct', 2.0)
         
         message = f"""🚨 <b>TRADE SIGNAL ALERT</b> 🚨
 
@@ -93,6 +95,7 @@ class TelegramCommunityBot:
 • Direction: SHORT ⬇️
 • Stop Loss: {stop_loss_pct}% (${notification.price * (1 + stop_loss_pct/100):,.2f})
 • Take Profit: {take_profit_pct}% (${notification.price * (1 - take_profit_pct/100):,.2f})
+• Trailing Stop: {trailing_stop_pct}% at {trailing_activation_pct}% profit
 • Risk/Reward: 1:{take_profit_pct/stop_loss_pct:.1f}
 
 ⚠️ <b>Risk Management:</b>

@@ -112,14 +112,13 @@ class MultiAssetStrategyEngine:
         }
         self.alert_cooldown_minutes = 15  # Minimum time between similar alerts
         
-        # Quick exit cooldown tracking
+        # Trade execution cooldown tracking
         self.asset_cooldowns = {
             'BTC': None,  # Will store {'end_time': datetime, 'reason': str, 'started_at': datetime}
             'ETH': None,
             'SOL': None
         }
-        self.cooldown_duration_hours = 1  # 1-hour cooldown for quick exits
-        self.quick_exit_threshold_minutes = 60  # Positions closed within 60 minutes trigger cooldown
+        self.cooldown_duration_hours = 1  # 1-hour cooldown after trade execution
         
     def update_position(self, asset: str, in_position: bool, entry_price: float = 0, 
                        asset_amount: float = 0, leveraged_value: float = 0):
@@ -186,25 +185,21 @@ class MultiAssetStrategyEngine:
         now = datetime.now(timezone.utc)
         return now < cooldown['end_time']
     
-    def apply_quick_exit_cooldown(self, asset: str, trade_duration_minutes: float):
-        """Apply cooldown if trade was closed quickly (< 60 minutes)"""
-        if trade_duration_minutes < self.quick_exit_threshold_minutes:
-            now = datetime.now(timezone.utc)
-            end_time = now + timedelta(hours=self.cooldown_duration_hours)
-            
-            self.asset_cooldowns[asset] = {
-                'end_time': end_time,
-                'reason': 'Quick Exit',
-                'started_at': now,
-                'duration_hours': self.cooldown_duration_hours,
-                'trade_duration_minutes': trade_duration_minutes
-            }
-            
-            logger.info(f"🕒 {asset}: Quick exit cooldown applied - {trade_duration_minutes:.1f}min trade, "
-                       f"cooldown until {end_time.strftime('%H:%M:%S UTC')}")
-            return True
+    def apply_trade_execution_cooldown(self, asset: str):
+        """Apply cooldown immediately after trade execution"""
+        now = datetime.now(timezone.utc)
+        end_time = now + timedelta(hours=self.cooldown_duration_hours)
         
-        return False
+        self.asset_cooldowns[asset] = {
+            'end_time': end_time,
+            'reason': 'Trade Execution',
+            'started_at': now,
+            'duration_hours': self.cooldown_duration_hours
+        }
+        
+        logger.info(f"🕒 {asset}: Trade execution cooldown applied - "
+                   f"cooldown until {end_time.strftime('%H:%M:%S UTC')}")
+        return True
     
     def get_cooldown_status(self, asset: str) -> dict:
         """Get detailed cooldown status for an asset"""
@@ -230,8 +225,7 @@ class MultiAssetStrategyEngine:
             'started_at': cooldown['started_at'],
             'end_time': cooldown['end_time'],
             'remaining_minutes': remaining_minutes,
-            'remaining_formatted': f"{remaining_minutes // 60}h {remaining_minutes % 60}m",
-            'trade_duration_minutes': cooldown.get('trade_duration_minutes', 0)
+            'remaining_formatted': f"{remaining_minutes // 60}h {remaining_minutes % 60}m"
         }
     
     def get_all_cooldown_status(self) -> dict:
@@ -616,7 +610,7 @@ class MultiAssetStrategyEngine:
     
     def should_exit_position(self, asset: str, current_price: float, current_time: datetime, 
                            current_regime: MarketRegime = None) -> tuple[bool, str]:
-        """Check if position should be exited based on strategy rules
+        """Check if position should be exited based on strategy rules with asset-specific risk parameters
         
         Returns:
             tuple: (should_exit: bool, exit_reason: str)
@@ -624,32 +618,55 @@ class MultiAssetStrategyEngine:
         if not self.asset_positions[asset]['in_position']:
             return False, ""
         
+        # Import settings here to avoid circular import
+        from config.settings import settings
+        
         position = self.asset_positions[asset]
         entry_price = position['entry_price']
         entry_time = position['entry_time']
         
+        # Get asset-specific risk parameters
+        risk_params = settings.get_asset_risk_params(asset)
+        stop_loss_pct = risk_params['stop_loss_pct'] * 100  # Convert to percentage
+        take_profit_pct = risk_params['take_profit_pct'] * 100
+        
         # Calculate P&L percentage (for short positions: profit when price goes down)
         pnl_pct = ((entry_price - current_price) / entry_price) * 100
         
-        # Regime-based exit (highest priority - market conditions no longer favorable)
-        if current_regime and current_regime == MarketRegime.INACTIVE:
-            logger.info(f"🔴 {asset}: Regime-based exit - Market no longer favorable for shorting")
-            return True, "Regime Change (INACTIVE)"
+        # Check cooldown expiry - if expired and regime not favorable, exit
+        if self.is_asset_in_cooldown(asset):
+            cooldown = self.asset_cooldowns.get(asset)
+            if cooldown and datetime.now(timezone.utc) >= cooldown['end_time']:
+                # Cooldown expired - check if conditions still favorable
+                if current_regime and current_regime == MarketRegime.INACTIVE:
+                    logger.info(f"🕒 {asset}: Cooldown expired and regime unfavorable - closing position")
+                    return True, "Cooldown Expired (Unfavorable Conditions)"
+                # Clear expired cooldown
+                self.asset_cooldowns[asset] = None
         
-        # Time-based exit (24 hours max hold)
+        # Exit conditions in priority order:
+        # Note: Trailing stops are now handled by Bybit directly, not in our logic
+        
+        # 1. Take profit target hit (backup check - Bybit should handle this too)
+        if pnl_pct >= take_profit_pct:
+            logger.info(f"🎯 {asset}: Take profit triggered at {pnl_pct:.2f}%")
+            return True, "Take Profit"
+        
+        # 2. Stop loss hit (backup check - Bybit should handle this too)
+        if pnl_pct <= -stop_loss_pct:
+            logger.info(f"🛑 {asset}: Stop loss triggered at {pnl_pct:.2f}%")
+            return True, "Stop Loss"
+        
+        # 3. Time-based exit (24 hours max hold)
         if entry_time and (current_time - entry_time) > timedelta(hours=24):
             logger.info(f"🕐 {asset}: Time-based exit after 24 hours")
             return True, "Time Limit (24h)"
         
-        # Stop loss (1.5% loss for short)
-        if pnl_pct <= -1.5:
-            logger.info(f"🛑 {asset}: Stop loss triggered at {pnl_pct:.2f}%")
-            return True, "Stop Loss"
-        
-        # Take profit (6% profit for short)
-        if pnl_pct >= 6.0:
-            logger.info(f"🎯 {asset}: Take profit triggered at {pnl_pct:.2f}%")
-            return True, "Take Profit"
+        # 4. Regime-based exit (market conditions no longer favorable) - only if not in cooldown
+        if (not self.is_asset_in_cooldown(asset) and 
+            current_regime and current_regime == MarketRegime.INACTIVE):
+            logger.info(f"🔴 {asset}: Regime-based exit - Market no longer favorable for shorting")
+            return True, "Regime Change (INACTIVE)"
         
         return False, ""
     

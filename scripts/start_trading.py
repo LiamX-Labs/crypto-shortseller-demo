@@ -312,9 +312,16 @@ class MultiAssetTradingSystem:
             logger.info(f"📏 {asset}: Final quantity: {asset_quantity:.8f}")
             logger.info(f"   Final USDT value: ${final_usdt_value:.2f}")
             
-            # Calculate stop loss and take profit
-            stop_loss_price = signal.price * (1 + settings.risk.stop_loss_pct)  # 1.5% above entry
-            take_profit_price = signal.price * (1 - settings.risk.take_profit_pct)  # 6% below entry
+            # Get asset-specific risk parameters
+            risk_params = settings.get_asset_risk_params(asset)
+            
+            # Calculate stop loss and take profit using asset-specific parameters
+            stop_loss_price = signal.price * (1 + risk_params['stop_loss_pct'])
+            take_profit_price = signal.price * (1 - risk_params['take_profit_pct'])
+            
+            # Calculate trailing stop parameters
+            trailing_activation_price = signal.price * (1 - risk_params['trailing_activation_pct'])  # Price where trailing starts
+            trailing_stop_distance = signal.price * risk_params['trailing_stop_pct']  # Distance from current price
             
             # Attempt to place order with retry logic
             max_retries = 3
@@ -322,14 +329,16 @@ class MultiAssetTradingSystem:
                 try:
                     logger.info(f"🎯 {asset}: Placing order attempt {attempt + 1}/{max_retries}")
                     
-                    # Place short order
+                    # Place short order with trailing stop
                     result = await self.bybit_client.place_order(
                         symbol=symbol,
                         side='Sell',
                         order_type='Market',
                         qty=asset_quantity,
                         stop_loss=stop_loss_price,
-                        take_profit=take_profit_price
+                        take_profit=take_profit_price,
+                        trailing_stop=trailing_stop_distance,
+                        trailing_activation=trailing_activation_price
                     )
                     
                     # If successful, break out of retry loop
@@ -365,12 +374,16 @@ class MultiAssetTradingSystem:
                 leveraged_value=leveraged_value
             )
             
+            # Apply trade execution cooldown immediately
+            self.strategy_engine.apply_trade_execution_cooldown(asset)
+            
             logger.info(f"🎯 {asset}: SHORT position opened")
             logger.info(f"   Price: ${signal.price:.4f}")
             logger.info(f"   Quantity: {asset_quantity:.6f}")
             logger.info(f"   Value: ${leveraged_value:.2f}")
-            logger.info(f"   Stop Loss: ${stop_loss_price:.4f}")
-            logger.info(f"   Take Profit: ${take_profit_price:.4f}")
+            logger.info(f"   Stop Loss: ${stop_loss_price:.4f} ({risk_params['stop_loss_pct']*100:.1f}%)")
+            logger.info(f"   Take Profit: ${take_profit_price:.4f} ({risk_params['take_profit_pct']*100:.1f}%)")
+            logger.info(f"   Trailing Stop: {risk_params['trailing_stop_pct']*100:.1f}% distance, activates at ${trailing_activation_price:.4f}")
             
             # Send Telegram notification
             if settings.telegram.enabled:
@@ -382,8 +395,10 @@ class MultiAssetTradingSystem:
                             'ema_240': signal.metadata.get('ema_240') if signal.metadata else 0,
                             'ema_600': signal.metadata.get('ema_600') if signal.metadata else 0,
                             'regime': signal.metadata.get('regime') if signal.metadata else 'ACTIVE',
-                            'stop_loss_pct': settings.risk.stop_loss_pct * 100,
-                            'take_profit_pct': settings.risk.take_profit_pct * 100,
+                            'stop_loss_pct': risk_params['stop_loss_pct'] * 100,
+                            'take_profit_pct': risk_params['take_profit_pct'] * 100,
+                            'trailing_stop_pct': risk_params['trailing_stop_pct'] * 100,
+                            'trailing_activation_pct': risk_params['trailing_activation_pct'] * 100,
                             'quantity': asset_quantity,
                             'leveraged_value': leveraged_value
                         }
@@ -437,13 +452,6 @@ class MultiAssetTradingSystem:
                         
                         # Update position tracking
                         self.strategy_engine.update_position(asset, False)
-                        
-                        # Apply quick exit cooldown if trade was closed quickly (< 60 minutes)
-                        if entry_time:
-                            trade_duration_minutes = (datetime.now(timezone.utc) - entry_time).total_seconds() / 60
-                            cooldown_applied = self.strategy_engine.apply_quick_exit_cooldown(asset, trade_duration_minutes)
-                            if cooldown_applied:
-                                logger.info(f"🕒 {asset}: Quick exit cooldown activated - {trade_duration_minutes:.1f}min trade")
                         
                         logger.info(f"🏁 {asset}: Position closed at ${current_price:.4f}")
                         logger.info(f"   P&L: ${pnl:+.2f} ({pnl_pct:+.2f}%)")

@@ -10,6 +10,10 @@ class AssetConfig:
     symbol: str
     allocation_pct: float
     leverage: int
+    stop_loss_pct: float
+    take_profit_pct: float
+    trailing_stop_pct: float
+    trailing_activation_pct: float
     enabled: bool = True
     
 @dataclass
@@ -89,11 +93,11 @@ class Settings:
             password=os.getenv('REDIS_PASSWORD', '')
         )
         
-        # Multi-Asset Configuration
+        # Multi-Asset Configuration with individual risk parameters
         self.assets = [
-            AssetConfig('BTC', 0.07, 10, True),
-            AssetConfig('ETH', 0.07, 10, True),
-            AssetConfig('SOL', 0.07, 10, True)
+            AssetConfig('BTC', 0.07, 10, 0.01, 0.03, 0.01, 0.02, True),  # 1% SL, 3% TP, 1% trailing at 2% profit
+            AssetConfig('ETH', 0.07, 10, 0.015, 0.045, 0.02, 0.02, True),  # 1.5% SL, 4.5% TP, 2% trailing at 2% profit
+            AssetConfig('SOL', 0.07, 10, 0.015, 0.06, 0.02, 0.03, True)   # 1.5% SL, 6% TP, 2% trailing at 3% profit
         ]
         
         # Risk Management Configuration
@@ -139,6 +143,23 @@ class Settings:
     
     def get_bybit_symbols(self) -> List[str]:
         return [f"{asset.symbol}USDT" for asset in self.get_enabled_assets()]
+    
+    def get_asset_config(self, symbol: str) -> AssetConfig:
+        """Get configuration for specific asset"""
+        for asset in self.assets:
+            if asset.symbol == symbol:
+                return asset
+        raise ValueError(f"Asset {symbol} not found in configuration")
+    
+    def get_asset_risk_params(self, symbol: str) -> Dict[str, float]:
+        """Get risk parameters for specific asset"""
+        asset_config = self.get_asset_config(symbol)
+        return {
+            'stop_loss_pct': asset_config.stop_loss_pct,
+            'take_profit_pct': asset_config.take_profit_pct,
+            'trailing_stop_pct': asset_config.trailing_stop_pct,
+            'trailing_activation_pct': asset_config.trailing_activation_pct
+        }
 
 # Global settings instance
 settings = Settings()

@@ -304,7 +304,8 @@ class BybitClient:
     
     async def place_order(self, symbol: str, side: str, order_type: str, qty: float,
                          price: float = None, stop_loss: float = None, 
-                         take_profit: float = None, reduce_only: bool = False) -> Dict:
+                         take_profit: float = None, trailing_stop: float = None,
+                         trailing_activation: float = None, reduce_only: bool = False) -> Dict:
         """Place an order on Bybit with proper validation and quantity rounding"""
         try:
             # Ensure instrument specs are available
@@ -345,6 +346,14 @@ class BybitClient:
             if take_profit:
                 params['takeProfit'] = str(take_profit)
                 params['tpOrderType'] = 'Market'
+            
+            # Add trailing stop parameters if provided
+            if trailing_stop and trailing_activation:
+                # For shorts: trailing stop moves down as price falls (favorable)
+                # activePrice is when trailing starts, trailingStop is the distance
+                params['activePrice'] = str(trailing_activation)
+                params['trailingStop'] = str(trailing_stop)
+                logger.info(f"Trailing stop set: activation at ${trailing_activation:.4f}, trailing distance ${trailing_stop:.4f}")
             
             if stop_loss and take_profit:
                 params['tpslMode'] = 'Full'

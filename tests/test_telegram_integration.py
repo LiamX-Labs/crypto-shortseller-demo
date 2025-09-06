@@ -90,13 +90,13 @@ async def test_telegram_integration():
     except Exception as e:
         print(f"❌ Regime change notification failed: {e}")
     
-    # Test 5: Quick Exit Cooldown Status (Demo)
+    # Test 5: Trade Execution Cooldown Status (Demo)
     print("\n🕒 Testing cooldown status reporting...")
     try:
-        # Simulate quick exit cooldown for demonstration
+        # Simulate trade execution cooldown for demonstration
         from src.core.strategy_engine import MultiAssetStrategyEngine
         demo_engine = MultiAssetStrategyEngine()
-        demo_engine.apply_quick_exit_cooldown('BTC', 45.0)  # 45-minute trade
+        demo_engine.apply_trade_execution_cooldown('BTC')  # Trade execution cooldown
         
         portfolio_with_cooldown = demo_engine.get_portfolio_summary()
         
