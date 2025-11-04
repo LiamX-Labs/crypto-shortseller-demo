@@ -21,6 +21,7 @@ from config.settings import settings
 from src.core.strategy_engine import MultiAssetStrategyEngine, MarketData
 from src.exchange.bybit_client import BybitClient
 from src.notifications.telegram_bot import telegram_bot, notify_trade_entry, notify_trade_exit, send_daily_report, notify_regime_change
+from src.integration.alpha_integration import get_integration
 
 # Configure logging with daily rotation (UTC+0)
 def setup_logging():
@@ -76,6 +77,10 @@ class MultiAssetTradingSystem:
         self.lock_file = None
         self.last_daily_reset = datetime.now(timezone.utc).date()
         self.account_balance = 0.0  # Cache balance from session startup
+
+        # Alpha infrastructure integration
+        self.alpha_integration = get_integration(bot_id='shortseller_001')
+        logger.info(f"Alpha integration status: {'✅ Connected' if self.alpha_integration.is_connected() else '⚠️ Not connected'}")
         
     async def initialize_system(self):
         """Initialize the trading system"""
@@ -373,7 +378,27 @@ class MultiAssetTradingSystem:
                 asset_amount=asset_quantity,
                 leveraged_value=leveraged_value
             )
-            
+
+            # 🔥 ALPHA INTEGRATION: Record fill to PostgreSQL
+            self.alpha_integration.record_fill(
+                symbol=symbol,
+                side='Sell',  # ShortSeller always sells
+                exec_price=signal.price,
+                exec_qty=asset_quantity,
+                order_id=result.get('orderId', 'unknown'),
+                close_reason='entry',
+                commission=float(result.get('cumExecFee', 0))
+            )
+
+            # 🔥 ALPHA INTEGRATION: Update position in Redis
+            self.alpha_integration.update_position(
+                symbol=symbol,
+                size=asset_quantity,
+                side='Sell',
+                avg_price=signal.price,
+                unrealized_pnl=0.0
+            )
+
             # Apply trade execution cooldown immediately
             self.strategy_engine.apply_trade_execution_cooldown(asset)
             
@@ -452,7 +477,27 @@ class MultiAssetTradingSystem:
                         
                         # Update position tracking
                         self.strategy_engine.update_position(asset, False)
-                        
+
+                        # 🔥 ALPHA INTEGRATION: Record exit fill to PostgreSQL
+                        self.alpha_integration.record_fill(
+                            symbol=symbol,
+                            side='Buy',  # Closing short = buy
+                            exec_price=current_price,
+                            exec_qty=position_data['asset_amount'],
+                            order_id='exit_order',  # Would need real order ID from close_position
+                            close_reason=exit_reason,
+                            commission=0.0  # Would need actual commission from order result
+                        )
+
+                        # 🔥 ALPHA INTEGRATION: Update position to flat in Redis
+                        self.alpha_integration.update_position(
+                            symbol=symbol,
+                            size=0.0,
+                            side='None',
+                            avg_price=0.0,
+                            unrealized_pnl=0.0
+                        )
+
                         logger.info(f"🏁 {asset}: Position closed at ${current_price:.4f}")
                         logger.info(f"   P&L: ${pnl:+.2f} ({pnl_pct:+.2f}%)")
                         
@@ -560,7 +605,10 @@ class MultiAssetTradingSystem:
             try:
                 current_time = datetime.now(timezone.utc).strftime('%H:%M:%S')
                 logger.info(f"🕐 {current_time} - Processing 5-minute bar close for all assets")
-                
+
+                # 🔥 ALPHA INTEGRATION: Send heartbeat to bot registry
+                self.alpha_integration.send_heartbeat()
+
                 # Check for daily reset at 00:01 UTC
                 await self.check_daily_reset()
                 
