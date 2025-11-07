@@ -103,12 +103,33 @@ class MultiAssetTradingSystem:
             
             logger.info("✅ Exchange connection established")
             logger.info(f"💰 Session Balance: ${self.account_balance:,.2f} USDT")
-            
+
+            # Update equity in database
+            if self.alpha_integration and self.alpha_integration.is_connected():
+                self.alpha_integration.update_equity(self.account_balance)
+                logger.info("✅ Equity updated in database")
+
             # Test Telegram connection
             if settings.telegram.enabled:
                 telegram_connected = await telegram_bot.test_connection()
                 if telegram_connected:
                     logger.info("📱 Telegram bot connected")
+
+                    # Send startup notification
+                    startup_status = {
+                        'balance': self.account_balance,
+                        'active_positions': 0,
+                        'daily_pnl': 0.0,
+                        'total_trades': 0,
+                        'assets_status': {
+                            asset: {
+                                'regime': 'INITIALIZING',
+                                'cooldown_status': {'in_cooldown': False}
+                            } for asset in self.assets
+                        }
+                    }
+                    await telegram_bot.send_system_status(startup_status)
+                    logger.info("📱 Startup notification sent to Telegram")
                 else:
                     logger.warning("⚠️ Telegram bot connection failed")
             else:

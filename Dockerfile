@@ -30,5 +30,8 @@ EXPOSE 8080
 HEALTHCHECK --interval=60s --timeout=30s --start-period=30s --retries=3 \
     CMD python -c "import requests; requests.get('http://localhost:8080/health')" || exit 1
 
-# Default command
-CMD ["python", "scripts/start_trading.py"]
+# Create startup script to run both services
+RUN echo '#!/bin/bash\npython fill_monitor_service.py &\npython scripts/start_trading.py' > /app/start.sh && chmod +x /app/start.sh
+
+# Default command - runs both bot and fill monitor
+CMD ["/app/start.sh"]

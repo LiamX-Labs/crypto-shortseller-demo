@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Dict, Optional
 
 # Add shared library to path
-alpha_root = Path(__file__).parent.parent.parent.parent
+alpha_root = Path(__file__).parent.parent.parent.parent.parent
 sys.path.insert(0, str(alpha_root))
 
 from shared.alpha_db_client import AlphaDBClient, create_client_order_id
@@ -45,11 +45,13 @@ class ShortSellerAlphaIntegration:
         """Initialize database client with retry logic."""
         try:
             # ShortSeller uses Redis DB 0 (per integration spec)
-            self.db_client = AlphaDBClient(bot_id=self.bot_id, redis_db=0)
+            self.db_client = AlphaDBClient(bot_id=self.bot_id, redis_db=1)
             logger.info(f"✅ Alpha infrastructure integration initialized for {self.bot_id}")
+            print(f"✅ Alpha infrastructure integration initialized for {self.bot_id}")
         except Exception as e:
             logger.error(f"❌ Failed to initialize Alpha integration: {e}")
-            logger.warning("⚠️ Strategy will continue without database integration")
+            print(f"⚠️ Alpha integration failed: {e}")
+            print("⚠️ Strategy will continue without database integration")
             self.db_client = None
 
     def is_connected(self) -> bool:
@@ -57,68 +59,217 @@ class ShortSellerAlphaIntegration:
         return self.db_client is not None
 
     # ========================================
-    # FILL TRACKING
+    # TRADE TRACKING (Integrates with trade_tracker)
     # ========================================
 
-    def record_fill(
+    def log_trade_opened(
         self,
         symbol: str,
         side: str,
-        exec_price: float,
-        exec_qty: float,
-        order_id: str,
-        close_reason: str,
-        commission: float = 0.0,
-        exec_time: datetime = None
+        entry_price: float,
+        position_size: float,
+        rule_id: str,
+        entry_timestamp: datetime = None
     ) -> bool:
         """
-        Record a fill to PostgreSQL.
-
-        This is called after EVERY order execution.
+        Log trade entry to PostgreSQL (called when trade opens).
 
         Args:
             symbol: Trading pair (e.g., 'BTCUSDT')
             side: 'Buy' or 'Sell'
-            exec_price: Execution price
-            exec_qty: Execution quantity
-            order_id: Bybit order ID
-            close_reason: Why executed ('entry', 'trailing_stop', etc.)
-            commission: Fee paid
-            exec_time: Execution time (defaults to now)
+            entry_price: Entry price
+            position_size: Position quantity
+            rule_id: Trading rule identifier
+            entry_timestamp: Entry time (defaults to now)
 
         Returns:
-            True if successful, False otherwise
+            True if successful
         """
         if not self.db_client:
-            logger.debug("Database integration not available, skipping fill recording")
             return False
 
         try:
-            # Create properly formatted client_order_id
-            client_order_id = create_client_order_id(self.bot_id, close_reason)
+            if entry_timestamp is None:
+                entry_timestamp = datetime.utcnow()
 
-            # Write to PostgreSQL
-            self.db_client.write_fill(
+            # Create trade ID from rule and timestamp
+            trade_id = f"{self.bot_id}_{symbol}_{rule_id}_{int(entry_timestamp.timestamp())}"
+
+            # Capitalize side for PostgreSQL constraint (Buy/Sell not buy/sell)
+            side_capitalized = side.capitalize() if side else side
+
+            # Record entry fill
+            fill_id = self.db_client.write_fill(
                 symbol=symbol,
-                side=side,
-                exec_price=exec_price,
-                exec_qty=exec_qty,
-                order_id=order_id,
-                client_order_id=client_order_id,
-                close_reason=close_reason,
-                commission=commission,
-                exec_time=exec_time
+                side=side_capitalized,
+                exec_price=entry_price,
+                exec_qty=position_size,
+                order_id=trade_id,
+                client_order_id=create_client_order_id(self.bot_id, 'entry'),
+                close_reason='entry',
+                commission=0.0,  # Will be updated from actual order
+                exec_time=entry_timestamp
             )
 
-            logger.info(f"📊 Fill recorded to PostgreSQL: {symbol} {side} {exec_qty} @ {exec_price} (reason: {close_reason})")
+            # 🔥 NEW: Create position entry for proper position tracking
+            self.db_client.create_position_entry(
+                symbol=symbol,
+                entry_price=entry_price,
+                quantity=position_size,
+                entry_time=entry_timestamp,
+                entry_order_id=trade_id,
+                entry_fill_id=fill_id,
+                commission=0.0
+            )
+
+            # Get current position summary (weighted average across all entries)
+            position = self.db_client.get_current_position_summary(symbol)
+            if position:
+                # Update Redis with weighted average price
+                self.db_client.update_position_redis(
+                    symbol=symbol,
+                    size=float(position['total_qty']),
+                    side=side_capitalized,
+                    avg_price=float(position['avg_entry_price']),
+                    unrealized_pnl=0.0
+                )
+                logger.info(f"📊 Trade entry logged: {symbol} {side} {position_size} @ {entry_price} (rule: {rule_id}), weighted avg: ${float(position['avg_entry_price']):.4f}")
+            else:
+                # Fallback if position summary fails
+                self.db_client.update_position_redis(
+                    symbol=symbol,
+                    size=position_size,
+                    side=side_capitalized,
+                    avg_price=entry_price,
+                    unrealized_pnl=0.0
+                )
+                logger.info(f"📊 Trade entry logged: {symbol} {side} {position_size} @ {entry_price} (rule: {rule_id})")
+
             return True
 
         except Exception as e:
-            logger.error(f"❌ Failed to record fill: {e}")
+            logger.error(f"❌ Failed to log trade entry: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def log_trade_closed(
+        self,
+        symbol: str,
+        side: str,
+        exit_price: float,
+        position_size: float,
+        pnl: float,
+        reason: str,
+        rule_id: str = None
+    ) -> bool:
+        """
+        Log trade exit to PostgreSQL (called when trade closes).
+
+        Args:
+            symbol: Trading pair
+            side: Original entry side ('Buy' or 'Sell')
+            exit_price: Exit price
+            position_size: Position quantity
+            pnl: Profit/loss in USD
+            reason: Close reason ('take_profit', 'stop_loss', 'trailing_stop', 'manual', etc.)
+            rule_id: Trading rule identifier (optional)
+
+        Returns:
+            True if successful
+        """
+        if not self.db_client:
+            return False
+
+        try:
+            # Determine exit side (opposite of entry)
+            exit_side = 'Sell' if side == 'Buy' else 'Buy'
+
+            # Create trade ID
+            trade_id = f"{self.bot_id}_{symbol}_exit_{int(datetime.utcnow().timestamp())}"
+            exit_time = datetime.utcnow()
+
+            # Record exit fill
+            self.db_client.write_fill(
+                symbol=symbol,
+                side=exit_side,
+                exec_price=exit_price,
+                exec_qty=position_size,
+                order_id=trade_id,
+                client_order_id=create_client_order_id(self.bot_id, reason),
+                close_reason=reason,
+                commission=0.0,  # Will be updated from actual order
+                exec_time=exit_time
+            )
+
+            # 🔥 NEW: Close position using FIFO matching
+            completed_trades = self.db_client.close_position_fifo(
+                symbol=symbol,
+                exit_price=exit_price,
+                close_qty=position_size,
+                exit_time=exit_time,
+                exit_reason=reason,
+                exit_commission=0.0
+            )
+
+            # Log completed trades
+            total_pnl = sum(t['net_pnl'] for t in completed_trades)
+            logger.info(f"📊 Trade exit logged: {symbol} closed {len(completed_trades)} entries, Total P&L: ${total_pnl:+.2f} - {reason}")
+
+            # Check remaining position
+            position = self.db_client.get_current_position_summary(symbol)
+            if position and float(position['total_qty']) > 0:
+                # Partial close - update Redis with remaining position
+                self.db_client.update_position_redis(
+                    symbol=symbol,
+                    size=float(position['total_qty']),
+                    side=side,
+                    avg_price=float(position['avg_entry_price']),
+                    unrealized_pnl=0.0
+                )
+                logger.info(f"📊 Partial close: {float(position['total_qty'])} remaining @ ${float(position['avg_entry_price']):.4f}")
+            else:
+                # Full close - update position to flat in Redis
+                self.db_client.update_position_redis(
+                    symbol=symbol,
+                    size=0.0,
+                    side='None',
+                    avg_price=0.0,
+                    unrealized_pnl=0.0
+                )
+
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Failed to log trade exit: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     # ========================================
-    # POSITION STATE (Redis)
+    # COMPATIBILITY METHODS
+    # ========================================
+
+    def record_fill(self, symbol: str, side: str, price: float, quantity: float,
+                    order_id: str = None, fee: float = 0.0, timestamp: datetime = None):
+        """
+        Compatibility method for ShortSeller bot.
+        Alias for write_fill with compatible parameter names.
+        """
+        return self.db_client.write_fill(
+            symbol=symbol,
+            side=side,
+            exec_price=price,
+            exec_qty=quantity,
+            order_id=order_id or f"shortseller_{symbol}_{int(datetime.utcnow().timestamp())}",
+            client_order_id=f"shortseller_{side.lower()}_{int(datetime.utcnow().timestamp())}",
+            close_reason='fill',
+            commission=fee,
+            exec_time=timestamp or datetime.utcnow()
+        )
+
+    # ========================================
+    # POSITION MANAGEMENT
     # ========================================
 
     def update_position(
@@ -131,8 +282,6 @@ class ShortSellerAlphaIntegration:
     ):
         """
         Update position state in Redis.
-
-        This is read by trading loops and monitoring systems.
 
         Args:
             symbol: Trading pair
