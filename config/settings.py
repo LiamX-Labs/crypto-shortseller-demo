@@ -94,10 +94,12 @@ class Settings:
         )
         
         # Multi-Asset Configuration with individual risk parameters
+        # DEMO VALUES - Configure based on your backtesting results and risk tolerance
+        # Parameters: (symbol, allocation_pct, leverage, stop_loss_pct, take_profit_pct, trailing_stop_pct, trailing_activation_pct, enabled)
         self.assets = [
-            AssetConfig('BTC', 0.07, 10, 0.01, 0.03, 0.01, 0.02, True),  # 1% SL, 3% TP, 1% trailing at 2% profit
-            AssetConfig('ETH', 0.07, 10, 0.015, 0.045, 0.02, 0.02, True),  # 1.5% SL, 4.5% TP, 2% trailing at 2% profit
-            AssetConfig('SOL', 0.07, 10, 0.015, 0.06, 0.02, 0.03, True)   # 1.5% SL, 6% TP, 2% trailing at 3% profit
+            AssetConfig('BTC', 0.05, 10, 0.01, 0.03, 0.01, 0.02, True),  # Example values
+            AssetConfig('ETH', 0.05, 10, 0.015, 0.04, 0.02, 0.02, True),  # Adjust per asset
+            AssetConfig('SOL', 0.05, 10, 0.015, 0.05, 0.02, 0.03, True)   # Test thoroughly
         ]
         
         # Risk Management Configuration

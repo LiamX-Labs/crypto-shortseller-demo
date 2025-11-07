@@ -87,8 +87,10 @@ class MultiAssetStrategyEngine:
             'ETH': 0,
             'SOL': 0
         }
-        self.cross_threshold = 12
-        
+        # Configure based on your backtesting - this is a demo value
+        # Adjust based on market conditions and risk tolerance
+        self.cross_threshold = 12  # Example: Daily EMA cross limit per asset
+
         # Market alert tracking
         self.previous_regimes = {
             'BTC': None,
@@ -110,15 +112,17 @@ class MultiAssetStrategyEngine:
             'ETH': [],
             'SOL': []
         }
-        self.alert_cooldown_minutes = 15  # Minimum time between similar alerts
-        
+        # Cooldown prevents notification spam - adjust as needed
+        self.alert_cooldown_minutes = 15  # Example: Minimum time between similar alerts
+
         # Trade execution cooldown tracking
         self.asset_cooldowns = {
             'BTC': None,  # Will store {'end_time': datetime, 'reason': str, 'started_at': datetime}
             'ETH': None,
             'SOL': None
         }
-        self.cooldown_duration_hours = 1  # 1-hour cooldown after trade execution
+        # Prevents overtrading - configure based on your strategy
+        self.cooldown_duration_hours = 1  # Example: 1-hour cooldown after trade execution
         
     def update_position(self, asset: str, in_position: bool, entry_price: float = 0, 
                        asset_amount: float = 0, leveraged_value: float = 0):
